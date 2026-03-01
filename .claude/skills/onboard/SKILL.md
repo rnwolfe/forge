@@ -42,6 +42,124 @@ useful on its own even if later phases are skipped.
 
 ---
 
+## Phase 0 — Prerequisites
+
+**Run this before anything else (full onboarding only, skip for reconfiguration modes).**
+
+### Check for `gh` CLI
+
+The GitHub CLI (`gh`) is required for Phases 5 and 6 (creating issues, labels, branch
+protection). Check if it's installed and authenticated:
+
+```bash
+gh --version 2>/dev/null
+gh auth status 2>/dev/null
+```
+
+**If `gh` is not installed**, help the user set it up:
+
+```
+The GitHub CLI (gh) is required for the full onboarding experience.
+It's used to create issues, configure labels, and set up branch protection.
+
+Install it:
+  macOS:   brew install gh
+  Linux:   https://github.com/cli/cli/blob/trunk/docs/install_linux.md
+  Windows: winget install --id GitHub.cli
+
+After installing, authenticate:
+  gh auth login
+
+You can proceed with Phases 1-4 without gh, but Phases 5-6 (GitHub setup) will be
+skipped. Run /onboard --verify later to finish setup.
+```
+
+If `gh` is installed but not authenticated (`gh auth status` fails), prompt:
+
+```
+gh is installed but not authenticated. Run:
+  gh auth login
+
+Then re-run /onboard to continue.
+```
+
+If the user wants to proceed without `gh`, note that Phases 5 and 6 will be skipped and
+they can run `/onboard --verify` later to finish the GitHub-dependent steps.
+
+### Fresh Git History
+
+When a user creates a repo from the forge template, it inherits forge's commit history.
+The project should start with a clean slate.
+
+Check the current git state:
+
+```bash
+git log --oneline -5 2>/dev/null
+git remote -v 2>/dev/null
+```
+
+If the repo has forge's template history (look for commits like "chore: initial forge
+template repo" or a remote pointing to `rnwolfe/forge`), offer to reset:
+
+```
+This repo was created from the forge template and still has forge's git history.
+Would you like to start with a clean git history? (Recommended)
+
+This will:
+  1. Remove the existing .git directory
+  2. Initialize a fresh git repo
+  3. Stage all template files as your first commit
+
+Your files will not be modified — only the git history changes.
+```
+
+If the user agrees:
+
+```bash
+rm -rf .git
+git init
+git add -A
+git commit -m "chore: initialize project from forge template
+
+Co-Authored-By: Claude <noreply@anthropic.com>"
+```
+
+### GitHub Repository
+
+After resetting git history (or if the repo has no remote), offer to create a GitHub
+repository:
+
+```bash
+git remote -v 2>/dev/null
+```
+
+If no remote is configured, ask:
+
+```
+No GitHub remote found. Would you like to create a GitHub repository now?
+
+I'll need:
+  1. Repository name (e.g., "myproject" or "org/myproject")
+  2. Visibility: public or private?
+```
+
+If the user provides the info:
+
+```bash
+# For personal repos:
+gh repo create $REPO_NAME --$VISIBILITY --source=. --push
+
+# For org repos:
+gh repo create $ORG/$REPO_NAME --$VISIBILITY --source=. --push
+```
+
+If the user wants to skip, note that they'll need a remote configured before Phases 5-6.
+Phases 1-4 work fine without a remote.
+
+If a remote already exists and points to the right repo, confirm and move on.
+
+---
+
 ## Reconfiguration Modes
 
 ### `--stack`
@@ -731,8 +849,11 @@ configured so far.
 |-----------|--------|
 | `forge.toml` missing | It should exist in the repo root (shipped with forge). If somehow missing, create it from the template in the forge README. |
 | User wants to skip a phase | Acknowledge and skip. Each phase is independently useful. Note what they skipped so they can return to it later. |
-| `gh` CLI not authenticated | Tell the user to run `gh auth login` first. Phases 5 and 6 require GitHub CLI authentication. |
-| Repo not on GitHub yet | Phases 1-4 work without a remote. Skip Phases 5-6 and tell the user to return after pushing to GitHub. |
+| `gh` CLI not installed | Walk the user through installation (brew, apt, winget). Phases 1-4 work without it. Phases 5-6 are skipped until `gh` is available. |
+| `gh` CLI not authenticated | Tell the user to run `gh auth login`. Offer to wait while they do it, or skip Phases 5-6. |
+| Repo not on GitHub yet | Offer to create it via `gh repo create`. If the user declines, Phases 1-4 work without a remote. Skip Phases 5-6 and tell the user to return after pushing to GitHub. |
+| Forge template git history present | Offer to reset with `rm -rf .git && git init`. Explain this only removes commit history, not files. |
 | Existing CLAUDE.md conflict | Ask: replace, merge (read existing and incorporate), or skip. |
 | Labels already exist | `create-labels.sh` is idempotent — it updates existing labels. This is safe to re-run. |
 | Branch protection fails | The script handles this gracefully — it prints manual instructions if the API call fails (usually a permissions issue). |
+| `gh repo create` fails | Usually a permissions issue or name conflict. Show the error and suggest creating the repo manually via GitHub UI, then adding the remote: `git remote add origin https://github.com/ORG/REPO.git && git push -u origin main`. |
