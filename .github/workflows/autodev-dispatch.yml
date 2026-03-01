@@ -1,0 +1,48 @@
+name: Autodev Dispatch
+
+on:
+  schedule:
+    - cron: "0 */1 * * *"
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to implement (optional — auto-picks if empty)"
+        required: false
+        type: string
+
+concurrency:
+  group: autodev-dispatch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pick issue
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE=$(bash scripts/autodev/pick-issue.sh "${{ inputs.issue_number }}")
+          echo "issue_number=$ISSUE" >> "$GITHUB_OUTPUT"
+          if [ -z "$ISSUE" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger implementation workflow
+        if: steps.pick.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run autodev-implement.yml \
+            -f issue_number="${{ steps.pick.outputs.issue_number }}"

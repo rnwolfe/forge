@@ -1,0 +1,275 @@
+name: Autodev Implement
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to implement"
+        required: true
+        type: string
+
+concurrency:
+  group: autodev-implement
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── STACK SETUP ──────────────────────────────────────────────
+      # Add language-specific setup steps here (e.g., Setup Go, Setup Node).
+      # The /onboard skill generates these based on your stack configuration.
+      # ─────────────────────────────────────────────────────────────
+
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Read issue and prepare branch
+        id: prep
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_JSON=$(gh issue view "${{ inputs.issue_number }}" \
+            --repo "${{ github.repository }}" \
+            --json title,body)
+
+          TITLE=$(echo "$ISSUE_JSON" | jq -r '.title')
+          BODY=$(echo "$ISSUE_JSON" | jq -r '.body')
+
+          source scripts/autodev/config.sh
+          SLUG=$(autodev_slugify "$TITLE")
+          BRANCH="autodev/issue-${{ inputs.issue_number }}-${SLUG}"
+
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+          EOF_DELIM=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          {
+            echo "ISSUE_BODY<<${EOF_DELIM}"
+            echo "$BODY"
+            echo "${EOF_DELIM}"
+          } >> "$GITHUB_ENV"
+
+      - name: Create branch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          BRANCH="${{ steps.prep.outputs.branch }}"
+          if git ls-remote --exit-code origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
+            echo "::notice::Deleting stale remote branch: $BRANCH"
+            git push origin --delete "$BRANCH" || true
+          fi
+          git checkout -b "$BRANCH"
+
+      # ============================================================
+      # AGENT EXECUTION — Provider: Claude via claude-code-action@v1
+      # To swap providers, replace this step.
+      # ============================================================
+      - name: Run agent
+        id: agent
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "github-actions[bot]"
+          prompt: |
+            You are implementing a feature for this project.
+
+            IMPORTANT RULES:
+            - Read CLAUDE.md first for project conventions
+            - Run the project's test and build commands to verify your changes
+            - Follow existing code patterns and style
+            - Do NOT modify protected files: CLAUDE.md, .github/workflows/, scripts/autodev/, forge.toml
+            - Write tests for new functionality
+            - Keep files under 500 lines
+
+            ## BLOCKER PROTOCOL
+
+            If you CANNOT implement this issue — for any reason — you MUST write a blocker
+            report to `/tmp/agent-blocker.md` explaining why.
+
+            Format:
+            ```
+            **Reason**: <one-line summary>
+            **Details**: <explanation>
+            **Questions for human** (if any):
+            - Question 1?
+            **Suggested next steps**:
+            - Step 1
+            ```
+
+            Do NOT silently exit with no changes. Always either implement the feature
+            OR write the blocker report.
+
+            ## Issue #${{ inputs.issue_number }}: ${{ steps.prep.outputs.title }}
+
+            ${{ env.ISSUE_BODY }}
+
+            ## PR Description (REQUIRED)
+
+            After completing the implementation, write a detailed PR description
+            to `/tmp/pr-description.md` with: Summary, Changes, Test Coverage,
+            Acceptance Criteria sections. Include `Closes #${{ inputs.issue_number }}`.
+
+            ## PR Title (REQUIRED)
+
+            Write the PR title to /tmp/pr-title.txt in conventional commit format:
+            `type: description` (lowercase type, no scope, no period).
+            Valid types: feat, fix, chore, docs, refactor, test, ci.
+          claude_args: "--model claude-sonnet-4-6 --max-turns 150 --dangerously-skip-permissions"
+      # ============================================================
+
+      - name: Handle agent failure
+        if: steps.agent.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          BLOCKER_MSG=""
+          if [ -f /tmp/agent-blocker.md ]; then
+            BLOCKER_MSG=$(cat /tmp/agent-blocker.md)
+          fi
+
+          COMMENT_BODY="⚠️ **Autodev agent failed during implementation.**
+
+          No changes were committed. This issue has been removed from the autodev queue and needs human attention.
+
+          [View logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+          if [ -n "$BLOCKER_MSG" ]; then
+            COMMENT_BODY="${COMMENT_BODY}
+
+          ### Agent Blocker Report
+          ${BLOCKER_MSG}"
+          fi
+
+          gh issue comment "${{ inputs.issue_number }}" \
+            --repo "${{ github.repository }}" \
+            --body "$COMMENT_BODY"
+          gh issue edit "${{ inputs.issue_number }}" \
+            --repo "${{ github.repository }}" \
+            --add-label "human/blocked" \
+            --remove-label "agent/implementing,backlog/ready"
+
+      - name: Revert protected file changes
+        if: steps.agent.outcome == 'success'
+        run: |
+          source scripts/autodev/config.sh
+          REGEX=$(autodev_protected_regex)
+          PROTECTED=$(git diff --name-only | grep -E "$REGEX" || true)
+          if [ -n "$PROTECTED" ]; then
+            echo "::warning::Agent modified protected files — reverting: $PROTECTED"
+            echo "$PROTECTED" | xargs git checkout --
+          fi
+
+      - name: Check for changes
+        if: steps.agent.outcome == 'success'
+        id: changes
+        run: |
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push
+        if: steps.agent.outcome == 'success' && steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git add -A
+          git commit -m "feat: implement #${{ inputs.issue_number }}" || true
+          git push -u origin "${{ steps.prep.outputs.branch }}"
+
+      - name: Create PR
+        if: steps.agent.outcome == 'success' && steps.changes.outputs.has_changes == 'true'
+        id: create-pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          PR_URL=$(bash scripts/autodev/open-pr.sh \
+            "${{ inputs.issue_number }}" \
+            "${{ steps.prep.outputs.branch }}")
+
+          PR_NUMBER=$(echo "$PR_URL" | grep -oP '/pull/\K\d+')
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for review and trigger review pipeline
+        if: steps.agent.outcome == 'success' && steps.changes.outputs.has_changes == 'true' && steps.create-pr.outputs.pr_number
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          PR_NUMBER="${{ steps.create-pr.outputs.pr_number }}"
+          echo "Waiting for Copilot review on PR #$PR_NUMBER..."
+
+          for i in $(seq 1 60); do
+            REVIEW_COUNT=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" \
+              --jq '[.[] | select(.user.login != "github-actions[bot]")] | length' 2>/dev/null || echo "0")
+
+            if [ "$REVIEW_COUNT" -gt 0 ]; then
+              echo "Review found after ~$((i * 10))s. Dispatching review-fix pipeline."
+              if gh workflow run autodev-review-fix.yml \
+                --repo "${{ github.repository }}" \
+                -f pr_number="$PR_NUMBER"; then
+                echo "Review-fix pipeline dispatched for PR #$PR_NUMBER."
+              else
+                echo "::warning::Failed to dispatch review-fix. The scheduled fallback will process this PR."
+              fi
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "::warning::No review appeared within 10 minutes. Review pipeline will rely on scheduled fallback."
+
+      - name: Handle no changes
+        if: steps.agent.outcome == 'success' && steps.changes.outputs.has_changes == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          BLOCKER_MSG=""
+          if [ -f /tmp/agent-blocker.md ]; then
+            BLOCKER_MSG=$(cat /tmp/agent-blocker.md)
+          fi
+
+          COMMENT_BODY="⚠️ **Autodev agent produced no changes.**
+
+          The agent ran but did not modify any files. This issue has been removed from the autodev queue and needs human attention.
+
+          [View logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+          if [ -n "$BLOCKER_MSG" ]; then
+            COMMENT_BODY="${COMMENT_BODY}
+
+          ### Agent Blocker Report
+          ${BLOCKER_MSG}"
+          fi
+
+          gh issue comment "${{ inputs.issue_number }}" \
+            --repo "${{ github.repository }}" \
+            --body "$COMMENT_BODY"
+
+          gh issue edit "${{ inputs.issue_number }}" \
+            --repo "${{ github.repository }}" \
+            --add-label "human/blocked" \
+            --remove-label "agent/implementing,backlog/ready"

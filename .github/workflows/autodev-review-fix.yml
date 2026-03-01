@@ -1,0 +1,689 @@
+name: Autodev Review Fix
+
+on:
+  pull_request_review:
+    types: [submitted]
+  workflow_run:
+    workflows: ["Claude Code Review"]
+    types: [completed]
+  # Direct dispatch: implement workflow chains into review-fix after PR creation
+  # and Copilot review, bypassing the pull_request_review trigger that gets gated
+  # by GitHub's first-time contributor approval for bot actors on public repos.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to process"
+        required: true
+        type: string
+  # Scheduled fallback: catches edge cases where neither the direct dispatch
+  # nor pull_request_review triggers fire. Reduced importance since implement
+  # now chains directly, but kept as a safety net.
+  schedule:
+    - cron: "30 */4 * * *"
+
+concurrency:
+  # schedule uses 'scheduled' as the group key (PR number is unknown at trigger time),
+  # so it can run concurrently with workflow_run/dispatch runs for the same PR.
+  # The Finalize step uses an idempotency guard (human/review-merge label check) to
+  # prevent duplicate completion comments when concurrent runs both reach the done phase.
+  group: autodev-review-fix-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || 'scheduled' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  review-fix:
+    # Skip events triggered by bots that aren't relevant reviewers
+    if: github.actor != 'vercel[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # ── Determine action ──────────────────────────────────────────
+      - name: Determine action
+        id: route
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pass review body via env var to avoid shell injection — the body
+          # contains arbitrary text (code references, file paths) that would
+          # be interpreted as commands if interpolated directly into the script.
+          EVENT_REVIEW_BODY: ${{ github.event.review.body }}
+        run: |
+          # Resolve PR number based on event type
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PR_NUMBER="${{ inputs.pr_number }}"
+            EVENT_SOURCE="dispatch"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            # Scheduled poll: find open autodev PRs not in "done" phase
+            PR_NUMBER=$(gh pr list --repo "${{ github.repository }}" \
+              --state open --json number,body,labels \
+              --jq '[.[] | select(.labels | map(.name) | any(startswith("via/"))) | select(.body | test("autodev-state") | not) // select(.body | test("\"phase\": \"done\"") | not)] | first | .number // empty')
+            if [ -z "$PR_NUMBER" ]; then
+              echo "No actionable autodev PRs found. Skipping."
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            EVENT_SOURCE="schedule"
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            # workflow_run: get PR from the triggering workflow's pull_requests
+            PR_NUMBER=$(echo '${{ toJSON(github.event.workflow_run.pull_requests) }}' \
+              | jq -r '.[0].number // empty')
+            if [ -z "$PR_NUMBER" ]; then
+              echo "No PR associated with workflow_run. Skipping."
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            EVENT_SOURCE="workflow_run"
+          else
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            EVENT_SOURCE="pull_request_review"
+          fi
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+          # Check if PR has autodev label
+          HAS_AUTODEV=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" \
+            --json labels --jq '[.labels[].name] | any(startswith("via/"))')
+          if [ "$HAS_AUTODEV" != "true" ]; then
+            echo "PR #$PR_NUMBER is not an autodev PR. Skipping."
+            echo "action=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Read phase state from PR body
+          PR_BODY=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" \
+            --json body --jq '.body')
+          PHASE=$(echo "$PR_BODY" | grep -oP '(?<=<!-- autodev-state: ).*?(?= -->)' | jq -r '.phase // "copilot"')
+          COPILOT_ITERS=$(echo "$PR_BODY" | grep -oP '(?<=<!-- autodev-state: ).*?(?= -->)' | jq -r '.copilot_iterations // 0')
+          echo "phase=$PHASE" >> "$GITHUB_OUTPUT"
+          echo "copilot_iterations=$COPILOT_ITERS" >> "$GITHUB_OUTPUT"
+
+          if [ "$PHASE" = "done" ]; then
+            echo "Phase is done. Skipping."
+            echo "action=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # For workflow_run events (Claude Code Review completed)
+          if [ "$EVENT_SOURCE" = "workflow_run" ]; then
+            CONCLUSION="${{ github.event.workflow_run.conclusion }}"
+            if [ "$CONCLUSION" != "success" ]; then
+              echo "Claude Code Review did not succeed (conclusion: $CONCLUSION). Skipping."
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$PHASE" = "claude" ]; then
+              echo "action=claude-fix" >> "$GITHUB_OUTPUT"
+            else
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          # For scheduled/dispatch events: check reviews via API (no event context)
+          if [ "$EVENT_SOURCE" = "schedule" ] || [ "$EVENT_SOURCE" = "dispatch" ]; then
+            # Get the latest review on this PR
+            LATEST_REVIEW=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" \
+              --jq '[.[] | select(.user.login != "github-actions[bot]")] | sort_by(.submitted_at) | last // empty')
+
+            if [ -z "$LATEST_REVIEW" ] || [ "$LATEST_REVIEW" = "null" ]; then
+              if [ "$PHASE" = "copilot" ]; then
+                # Copilot hasn't reviewed yet — re-request in case the initial request was missed,
+                # then wait. Never skip Copilot review entirely: Copilot always reviews first,
+                # even if they have no comments (LGTM). Transition to Claude only after Copilot
+                # has actually posted a review. The 4-hour scheduled poll will check again.
+                echo "No Copilot review found on PR #$PR_NUMBER. Re-requesting Copilot review and waiting..."
+                gh api -X POST \
+                  "repos/${{ github.repository }}/pulls/$PR_NUMBER/requested_reviewers" \
+                  -f 'reviewers[]=copilot-pull-request-reviewer' 2>/dev/null || true
+                echo "action=skip" >> "$GITHUB_OUTPUT"
+              else
+                echo "No reviews found on PR #$PR_NUMBER in phase '$PHASE'. Skipping."
+                echo "action=skip" >> "$GITHUB_OUTPUT"
+              fi
+              exit 0
+            fi
+
+            REVIEWER=$(echo "$LATEST_REVIEW" | jq -r '.user.login')
+            echo "reviewer=$REVIEWER" >> "$GITHUB_OUTPUT"
+
+            # Check if there are commits after the latest review (already processed)
+            REVIEW_DATE=$(echo "$LATEST_REVIEW" | jq -r '.submitted_at')
+            LATEST_COMMIT_DATE=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/commits" \
+              --jq '[.[].commit.committer.date] | sort | last')
+
+            if [[ "$LATEST_COMMIT_DATE" > "$REVIEW_DATE" ]]; then
+              echo "Latest commit is newer than latest review — already processed. Skipping."
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # Check for inline comments
+            COMMENT_COUNT=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/comments" \
+              --jq '[.[] | select(.user.login != "github-actions[bot]")] | length')
+
+            if [ "$PHASE" = "copilot" ]; then
+              HAS_FEEDBACK=false
+              REVIEW_BODY=$(echo "$LATEST_REVIEW" | jq -r '.body // ""')
+              if [ -n "$REVIEW_BODY" ] && [ "$REVIEW_BODY" != "null" ] && [ "$REVIEW_BODY" != "" ]; then
+                HAS_FEEDBACK=true
+              fi
+              if [ "$COMMENT_COUNT" -gt 0 ]; then
+                HAS_FEEDBACK=true
+              fi
+
+              if [ "$HAS_FEEDBACK" = "true" ] && [ "$COPILOT_ITERS" -lt 3 ]; then
+                echo "action=copilot-fix" >> "$GITHUB_OUTPUT"
+              else
+                echo "action=trigger-claude" >> "$GITHUB_OUTPUT"
+              fi
+              exit 0
+            fi
+
+            if [ "$PHASE" = "claude" ]; then
+              echo "action=claude-fix" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "Scheduled: unknown phase $PHASE. Skipping."
+            echo "action=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # For pull_request_review events: check reviewer identity
+          # Note: Copilot reviews appear as either "Copilot" or "copilot-pull-request-reviewer[bot]"
+          REVIEWER="${{ github.event.review.user.login }}"
+          REVIEW_STATE="${{ github.event.review.state }}"
+          echo "reviewer=$REVIEWER" >> "$GITHUB_OUTPUT"
+
+          # Skip bot reviewers entirely on pull_request_review. Bot phases are handled by
+          # dedicated triggers: copilot → workflow_dispatch (from implement), claude →
+          # workflow_run (after Claude Code Review completes). Allowing pull_request_review
+          # to fire for bots causes duplicate fix runs — each review comment Claude posts
+          # triggers a separate pull_request_review event.
+          if [[ "$REVIEWER" == *"[bot]"* ]] || [ "$REVIEWER" = "claude" ]; then
+            echo "Skipping pull_request_review from bot reviewer: $REVIEWER (handled by workflow_run/dispatch)"
+            echo "action=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          IS_COPILOT=false
+          if [ "$REVIEWER" = "Copilot" ] || [ "$REVIEWER" = "copilot-pull-request-reviewer[bot]" ]; then
+            IS_COPILOT=true
+          fi
+
+          if [ "$PHASE" = "copilot" ]; then
+            if [ "$IS_COPILOT" != "true" ]; then
+              echo "Copilot phase but reviewer is $REVIEWER. Skipping."
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # Check if review has actionable comments
+            HAS_COMMENTS=false
+            REVIEW_BODY="$EVENT_REVIEW_BODY"
+            if [ -n "$REVIEW_BODY" ] && [ "$REVIEW_BODY" != "null" ]; then
+              HAS_COMMENTS=true
+            fi
+            # Also check for inline comments on this review
+            REVIEW_ID="${{ github.event.review.id }}"
+            INLINE_COUNT=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews/$REVIEW_ID/comments" \
+              --jq 'length' 2>/dev/null || echo "0")
+            if [ "$INLINE_COUNT" -gt 0 ]; then
+              HAS_COMMENTS=true
+            fi
+
+            if [ "$HAS_COMMENTS" = "true" ] && [ "$COPILOT_ITERS" -lt 3 ]; then
+              echo "action=copilot-fix" >> "$GITHUB_OUTPUT"
+            else
+              echo "action=trigger-claude" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          if [ "$PHASE" = "claude" ]; then
+            if [ "$IS_COPILOT" = "true" ]; then
+              echo "Claude phase but reviewer is Copilot. Skipping."
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "action=claude-fix" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Unknown phase: $PHASE. Skipping."
+          echo "action=skip" >> "$GITHUB_OUTPUT"
+
+      # ── Generate app token (shared by all non-skip paths) ─────────
+      - name: Generate app token
+        id: app-token
+        if: steps.route.outputs.action != 'skip'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      # ── Checkout (shared by all fix paths) ────────────────────────
+      - name: Checkout PR branch
+        if: steps.route.outputs.action != 'skip'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request_review' && github.event.pull_request.head.ref || '' }}
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Resolve PR branch for non-review events
+        if: steps.route.outputs.action != 'skip' && github.event_name != 'pull_request_review'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH=$(gh pr view "${{ steps.route.outputs.pr_number }}" \
+            --repo "${{ github.repository }}" --json headRefName --jq '.headRefName')
+          git fetch origin "$BRANCH"
+          git checkout "$BRANCH"
+
+      # ── STACK SETUP ──────────────────────────────────────────────
+      # Add language-specific setup steps here (e.g., Setup Go, Setup Node).
+      # The /onboard skill generates these based on your stack configuration.
+      # ─────────────────────────────────────────────────────────────
+
+      # ── Copilot fix path ──────────────────────────────────────────
+      - name: Reconcile branch (copilot fix)
+        if: steps.route.outputs.action == 'copilot-fix'
+        run: |
+          git pull --rebase origin "$(git branch --show-current)" || {
+            echo "::error::Branch reconciliation failed"
+            exit 1
+          }
+
+      - name: Extract review feedback (copilot)
+        if: steps.route.outputs.action == 'copilot-fix'
+        id: copilot-feedback
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! bash scripts/autodev/parse-reviews.sh \
+            "${{ steps.route.outputs.pr_number }}" > /tmp/review-feedback.txt; then
+            echo "::error::parse-reviews.sh failed — gh API or jq error. Transitioning to claude phase as fallback."
+            echo "override_action=trigger-claude" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ ! -s /tmp/review-feedback.txt ]; then
+            echo "No actionable feedback found. Transitioning to claude phase."
+            echo "override_action=trigger-claude" >> "$GITHUB_OUTPUT"
+            # Note: We intentionally do NOT increment the copilot iteration counter here.
+            # No actionable feedback means no fix cycle occurred, so we transition directly
+            # to the Claude phase without counting it as a fix iteration.
+            exit 0
+          fi
+
+          EOF_DELIM=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          {
+            echo "REVIEW_FEEDBACK<<${EOF_DELIM}"
+            cat /tmp/review-feedback.txt
+            echo "${EOF_DELIM}"
+          } >> "$GITHUB_ENV"
+
+      # ============================================================
+      # AGENT EXECUTION (copilot fix) — Provider: Claude via claude-code-action@v1
+      # ============================================================
+      - name: Run agent (copilot fix)
+        if: steps.route.outputs.action == 'copilot-fix' && steps.copilot-feedback.outputs.override_action != 'trigger-claude'
+        id: copilot-agent
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "github-actions[bot],claude,claude[bot]"
+          prompt: |
+            You are fixing Copilot review feedback on PR #${{ steps.route.outputs.pr_number }} for this project.
+
+            IMPORTANT RULES:
+            - Read CLAUDE.md first for project conventions
+            - Run the project's test and build commands to verify your changes
+            - Follow existing code patterns and style
+            - Do NOT modify protected files: CLAUDE.md, .github/workflows/, scripts/autodev/, forge.toml
+            - Address ALL review comments below
+            - If a comment is unclear, make your best judgment
+
+            REVIEW COMMENT REPLIES:
+            After addressing each inline review comment, reply directly to it on GitHub
+            for easy tracking. Each inline comment includes a `[comment_id: NNNNN]` tag.
+            Use this command to reply:
+              gh api "repos/${{ github.repository }}/pulls/${{ steps.route.outputs.pr_number }}/comments/{COMMENT_ID}/replies" -f body="<your reply>"
+            Your reply should briefly explain what you changed to address the comment.
+            If you chose not to change something, explain why.
+
+            IMPORTANT: Do NOT use `gh pr review` to post new reviews on this PR. Only use
+            the inline comment reply API above. The review pipeline manages review state.
+
+            Also: before replying to any comment, check whether you have already replied
+            to it in a previous iteration. The feedback below has been pre-filtered to
+            exclude already-handled comments, but if you see a comment you know you've
+            already addressed, skip it rather than reply again.
+
+            ## Review Feedback to Address
+
+            ${{ env.REVIEW_FEEDBACK }}
+          claude_args: "--model claude-sonnet-4-6 --max-turns 50 --dangerously-skip-permissions"
+      # ============================================================
+
+      - name: Handle agent failure (copilot fix)
+        if: steps.route.outputs.action == 'copilot-fix' && steps.copilot-feedback.outputs.override_action != 'trigger-claude' && steps.copilot-agent.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          echo "::error::Copilot fix agent failed (outcome: ${{ steps.copilot-agent.outcome }}). No changes were committed."
+          echo "::error::See logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh pr edit "${{ steps.route.outputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --add-label "human/blocked"
+          gh pr comment "${{ steps.route.outputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --body "⚠️ Autodev agent failed during copilot review fix (iteration $(( ${{ steps.route.outputs.copilot_iterations }} + 1 ))). No changes were committed. [View logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+      - name: Revert protected files (copilot fix)
+        if: steps.route.outputs.action == 'copilot-fix' && steps.copilot-feedback.outputs.override_action != 'trigger-claude' && steps.copilot-agent.outcome == 'success'
+        run: |
+          source scripts/autodev/config.sh
+          REGEX=$(autodev_protected_regex)
+          PROTECTED=$(git diff --name-only | grep -E "$REGEX" || true)
+          if [ -n "$PROTECTED" ]; then
+            echo "::warning::Agent modified protected files — reverting: $PROTECTED"
+            echo "$PROTECTED" | xargs git checkout --
+          fi
+
+      - name: Check for changes (copilot fix)
+        if: steps.route.outputs.action == 'copilot-fix' && steps.copilot-feedback.outputs.override_action != 'trigger-claude' && steps.copilot-agent.outcome == 'success'
+        id: copilot-changes
+        run: |
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push (copilot fix)
+        if: steps.route.outputs.action == 'copilot-fix' && steps.copilot-feedback.outputs.override_action != 'trigger-claude' && steps.copilot-agent.outcome == 'success' && steps.copilot-changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          NEXT_ITER=$(( ${{ steps.route.outputs.copilot_iterations }} + 1 ))
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git add -A
+          git commit -m "fix: address copilot review feedback (iteration $NEXT_ITER)"
+          git push
+
+      - name: Update copilot iteration counter
+        if: steps.route.outputs.action == 'copilot-fix' && steps.copilot-feedback.outputs.override_action != 'trigger-claude' && steps.copilot-agent.outcome == 'success' && steps.copilot-changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEXT_ITER=$(( ${{ steps.route.outputs.copilot_iterations }} + 1 ))
+          PR_BODY=$(gh pr view "${{ steps.route.outputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --json body --jq '.body')
+
+          UPDATED_BODY=$(echo "$PR_BODY" | sed \
+            "s/<!-- autodev-state: [^>]* -->/<!-- autodev-state: {\"phase\": \"copilot\", \"copilot_iterations\": $NEXT_ITER} -->/")
+
+          gh pr edit "${{ steps.route.outputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --body "$UPDATED_BODY"
+
+      # ── Trigger Claude path ───────────────────────────────────────
+      # Transitions to Claude when:
+      # 1. Router decided to trigger-claude (no Copilot comments or max iterations)
+      # 2. Feedback extraction found nothing actionable (override)
+      # 3. Copilot fix agent ran successfully — regardless of whether changes were committed.
+      #    With changes: all Copilot comments were addressed; no re-review needed.
+      #    Without changes: agent found nothing to fix; escalate to Claude.
+      - name: Transition to Claude phase
+        if: |
+          steps.route.outputs.action == 'trigger-claude'
+          || steps.copilot-feedback.outputs.override_action == 'trigger-claude'
+          || (steps.route.outputs.action == 'copilot-fix' && steps.copilot-feedback.outputs.override_action != 'trigger-claude' && steps.copilot-agent.outcome == 'success')
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # Update phase in PR body
+          PR_BODY=$(gh pr view "${{ steps.route.outputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --json body --jq '.body')
+
+          COPILOT_ITER=$(echo "$PR_BODY" | grep -oP '(?<=<!-- autodev-state: ).*?(?= -->)' | jq -r '.copilot_iterations // 0')
+          UPDATED_BODY=$(echo "$PR_BODY" | sed \
+            "s/<!-- autodev-state: [^>]* -->/<!-- autodev-state: {\"phase\": \"claude\", \"copilot_iterations\": $COPILOT_ITER} -->/")
+
+          gh pr edit "${{ steps.route.outputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --body "$UPDATED_BODY"
+
+          # Add label to trigger Claude Code Review
+          gh pr edit "${{ steps.route.outputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --add-label "agent/review-claude" \
+            --remove-label "agent/review-copilot"
+
+      # ── Claude fix path ───────────────────────────────────────────
+      - name: Reconcile branch (claude fix)
+        if: steps.route.outputs.action == 'claude-fix'
+        run: |
+          git pull --rebase origin "$(git branch --show-current)" || {
+            echo "::error::Branch reconciliation failed"
+            exit 1
+          }
+
+      - name: Extract review feedback (claude)
+        if: steps.route.outputs.action == 'claude-fix'
+        id: claude-feedback
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Exclude Copilot's reviews so only Claude's github-actions[bot] review is seen.
+          if ! bash scripts/autodev/parse-reviews.sh \
+            "${{ steps.route.outputs.pr_number }}" \
+            "copilot-pull-request-reviewer[bot]" > /tmp/review-feedback.txt; then
+            echo "::error::parse-reviews.sh failed — gh API or jq error. Cannot extract Claude review feedback."
+            echo "::error::Review feedback was NOT addressed. Manual intervention required."
+            exit 1
+          fi
+
+          if [ ! -s /tmp/review-feedback.txt ]; then
+            echo "No review feedback found after Claude review. Marking done."
+            echo "no_feedback=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          EOF_DELIM=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          {
+            echo "REVIEW_FEEDBACK<<${EOF_DELIM}"
+            cat /tmp/review-feedback.txt
+            echo "${EOF_DELIM}"
+          } >> "$GITHUB_ENV"
+
+      # ============================================================
+      # AGENT EXECUTION (claude fix) — Provider: Claude via claude-code-action@v1
+      # ============================================================
+      - name: Run agent (claude fix)
+        if: steps.route.outputs.action == 'claude-fix' && steps.claude-feedback.outputs.no_feedback != 'true'
+        id: claude-agent
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "github-actions[bot],claude,claude[bot]"
+          prompt: |
+            You are doing a final review-fix pass on PR #${{ steps.route.outputs.pr_number }} for this project.
+            This is the last automated fix cycle — make it count.
+
+            IMPORTANT RULES:
+            - Read CLAUDE.md first for project conventions
+            - Run the project's test and build commands to verify your changes
+            - Follow existing code patterns and style
+            - Do NOT modify protected files: CLAUDE.md, .github/workflows/, scripts/autodev/, forge.toml
+            - Address ALL review comments below
+            - For anything that CANNOT be fully resolved in this PR, create a follow-up
+              GitHub issue using `gh issue create` with:
+              - A clear, descriptive title
+              - Detailed description of what needs to be done
+              - Acceptance criteria as a checkbox list
+              - Reference to this PR for context
+
+            REVIEW COMMENT REPLIES:
+            After addressing each inline review comment, reply directly to it on GitHub
+            for easy tracking. Each inline comment includes a `[comment_id: NNNNN]` tag.
+            Use this command to reply:
+              gh api "repos/${{ github.repository }}/pulls/${{ steps.route.outputs.pr_number }}/comments/{COMMENT_ID}/replies" -f body="<your reply>"
+            Your reply should briefly explain what you changed to address the comment.
+            If you chose not to change something, explain why.
+            If you created a follow-up issue instead, include the issue link in your reply.
+
+            IMPORTANT: Do NOT use `gh pr review` to post new reviews on this PR. Only use
+            the inline comment reply API above. The review pipeline manages review state.
+
+            Also: before replying to any comment, check whether you have already replied
+            to it in a previous iteration. The feedback below has been pre-filtered to
+            exclude already-handled comments, but if you see a comment you know you've
+            already addressed, skip it rather than reply again.
+
+            ## Review Feedback to Address
+
+            ${{ env.REVIEW_FEEDBACK }}
+          claude_args: "--model claude-sonnet-4-6 --max-turns 50 --dangerously-skip-permissions"
+      # ============================================================
+
+      - name: Handle agent failure (claude fix)
+        if: steps.route.outputs.action == 'claude-fix' && steps.claude-feedback.outputs.no_feedback != 'true' && steps.claude-agent.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          echo "::error::Claude fix agent failed (outcome: ${{ steps.claude-agent.outcome }}). No changes were committed."
+          echo "::error::See logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh pr edit "${{ steps.route.outputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --add-label "human/blocked"
+          gh pr comment "${{ steps.route.outputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --body "⚠️ Autodev agent failed during final Claude review fix. No changes were committed. This PR needs human attention. [View logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+      - name: Revert protected files (claude fix)
+        if: steps.route.outputs.action == 'claude-fix' && steps.claude-feedback.outputs.no_feedback != 'true' && steps.claude-agent.outcome == 'success'
+        run: |
+          source scripts/autodev/config.sh
+          REGEX=$(autodev_protected_regex)
+          PROTECTED=$(git diff --name-only | grep -E "$REGEX" || true)
+          if [ -n "$PROTECTED" ]; then
+            echo "::warning::Agent modified protected files — reverting: $PROTECTED"
+            echo "$PROTECTED" | xargs git checkout --
+          fi
+
+      - name: Check for changes (claude fix)
+        if: steps.route.outputs.action == 'claude-fix' && steps.claude-feedback.outputs.no_feedback != 'true' && steps.claude-agent.outcome == 'success'
+        id: claude-changes
+        run: |
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push (claude fix)
+        if: steps.route.outputs.action == 'claude-fix' && steps.claude-feedback.outputs.no_feedback != 'true' && steps.claude-agent.outcome == 'success' && steps.claude-changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git add -A
+          git commit -m "fix: address claude review feedback (final pass)"
+          git push
+
+      - name: Dismiss CHANGES_REQUESTED reviews (claude fix)
+        if: steps.route.outputs.action == 'claude-fix' && (steps.claude-feedback.outputs.no_feedback == 'true' || steps.claude-agent.outcome == 'success')
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          PR_NUMBER="${{ steps.route.outputs.pr_number }}"
+          # Dismiss any outstanding CHANGES_REQUESTED reviews from claude[bot].
+          # The claude-code-action submits CHANGES_REQUESTED reviews; subsequent COMMENTED
+          # reviews from the fix agent do not automatically dismiss them. Without explicit
+          # dismissal, GitHub blocks merge even after all comments are addressed.
+          gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" \
+            --jq '.[] | select(.user.login == "claude[bot]" and .state == "CHANGES_REQUESTED") | .id' \
+          | while read -r REVIEW_ID; do
+            echo "Dismissing CHANGES_REQUESTED review $REVIEW_ID from claude[bot]"
+            gh api -X PUT \
+              "repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews/$REVIEW_ID/dismissals" \
+              -f message="All review comments addressed by the claude-fix agent." || true
+          done
+
+      - name: Finalize — mark phase done
+        if: steps.route.outputs.action == 'claude-fix' && (steps.claude-feedback.outputs.no_feedback == 'true' || steps.claude-agent.outcome == 'success')
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          PR_NUMBER="${{ steps.route.outputs.pr_number }}"
+
+          # Idempotency guard: re-read current state to prevent duplicate finalization.
+          # schedule and workflow_run use different concurrency groups so they can run
+          # concurrently. Both may see phase=="claude" before either updates it to "done".
+          CURRENT_LABELS=$(gh pr view "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --json labels --jq '[.labels[].name]')
+          if echo "$CURRENT_LABELS" | jq -e 'index("human/review-merge") or index("agent/auto-merge")' >/dev/null 2>&1; then
+            echo "PR #$PR_NUMBER already finalized (merge label present). Skipping duplicate."
+            exit 0
+          fi
+
+          # Update phase to done in PR body
+          PR_BODY=$(gh pr view "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --json body --jq '.body')
+
+          COPILOT_ITER=$(echo "$PR_BODY" | grep -oP '(?<=<!-- autodev-state: ).*?(?= -->)' | jq -r '.copilot_iterations // 0')
+          UPDATED_BODY=$(echo "$PR_BODY" | sed \
+            "s/<!-- autodev-state: [^>]* -->/<!-- autodev-state: {\"phase\": \"done\", \"copilot_iterations\": $COPILOT_ITER} -->/")
+
+          gh pr edit "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --body "$UPDATED_BODY"
+
+          # Read gating config from forge.toml to decide auto-merge vs human merge.
+          # Falls back to human merge if config is unavailable or auto-merge fails.
+          source scripts/autodev/config.sh
+          MERGE_LABEL="human/review-merge"
+          MERGE_NOTE="Labeled \`human/review-merge\` for manual merge."
+
+          if [ "$FORGE_AUTO_MERGE" = "true" ] && [ "$FORGE_HUMAN_MERGE_REQUIRED" != "true" ]; then
+            # Attempt auto-merge — squash-merges as soon as all required CI checks pass.
+            if gh pr merge "$PR_NUMBER" \
+              --repo "${{ github.repository }}" \
+              --squash --auto \
+              --delete-branch 2>/dev/null; then
+              echo "Auto-merge enabled on PR #$PR_NUMBER — will squash-merge when CI passes."
+              MERGE_LABEL="agent/auto-merge"
+              MERGE_NOTE="Auto-merge enabled — will squash-merge once all CI checks pass."
+            else
+              echo "::warning::Auto-merge could not be enabled on PR #$PR_NUMBER. Human merge required."
+            fi
+          fi
+
+          # Remove review label and add appropriate merge-state label
+          if ! gh pr edit "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --remove-label "agent/review-claude" \
+            --add-label "$MERGE_LABEL"; then
+            echo "::warning::Failed to update labels on PR #$PR_NUMBER. There may be permission/API issues."
+          fi
+
+          # Post completion comment
+          gh pr comment "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --body "Autodev review pipeline complete. Copilot and Claude reviews have been addressed. ${MERGE_NOTE}"

@@ -1,0 +1,73 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+jobs:
+  claude-review:
+    if: |
+      (github.event_name == 'pull_request' && github.event.label.name == 'agent/review-claude') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@claude'))
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve PR number
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "github-actions[bot]"
+          prompt: |
+            Review PR #${{ steps.pr.outputs.number }} in ${{ github.repository }}.
+
+            Steps:
+            1. Fetch the PR metadata and diff:
+               gh pr view ${{ steps.pr.outputs.number }} --repo ${{ github.repository }} --json title,body,additions,deletions,changedFiles
+               gh pr diff ${{ steps.pr.outputs.number }} --repo ${{ github.repository }}
+
+            2. Read CLAUDE.md for project conventions (if it exists).
+
+            3. Review all changes, checking for:
+               - Logic errors and correctness
+               - Security issues (injection, path traversal, hardcoded secrets, OWASP top 10)
+               - Test coverage for new functionality
+               - Adherence to project patterns documented in CLAUDE.md
+               - Documentation updates required when features/commands change
+
+            4. You MUST post a formal PR review — the pipeline depends on it.
+
+               If the PR is clean (no issues):
+               gh pr review ${{ steps.pr.outputs.number }} --repo ${{ github.repository }} --comment \
+                 --body $'## Claude Code Review\n\nLGTM — no issues found.\n\n[Brief summary of what was reviewed]'
+
+               If there are blocking issues:
+               gh pr review ${{ steps.pr.outputs.number }} --repo ${{ github.repository }} --request-changes \
+                 --body $'## Claude Code Review\n\n[Summary]\n\n### Required changes\n- Issue 1\n- Issue 2'
+
+               If there are non-blocking suggestions only:
+               gh pr review ${{ steps.pr.outputs.number }} --repo ${{ github.repository }} --comment \
+                 --body $'## Claude Code Review\n\n[Summary] Suggestions below are non-blocking.\n\n### Suggestions\n- Suggestion 1'
+          claude_args: "--model claude-sonnet-4-6 --max-turns 20 --dangerously-skip-permissions"
