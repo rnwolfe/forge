@@ -1,0 +1,26 @@
+#!/usr/bin/env sh
+# Enforce conventional commits: type: description
+# Valid types: feat, fix, chore, docs, refactor, test, ci, build, perf, style, revert
+
+COMMIT_MSG_FILE="$1"
+COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
+
+# Skip merge commits, fixups, and squashes
+case "$COMMIT_MSG" in
+  Merge*|fixup!*|squash!*) exit 0 ;;
+esac
+
+PATTERN='^(feat|fix|chore|docs|refactor|test|ci|build|perf|style|revert)(\(.+\))?: .+'
+
+if ! echo "$COMMIT_MSG" | grep -qE "$PATTERN"; then
+  echo ""
+  echo "ERROR: Commit message does not follow conventional commits format."
+  echo ""
+  echo "  Expected: type: description"
+  echo "  Got:      $COMMIT_MSG"
+  echo ""
+  echo "  Valid types: feat, fix, chore, docs, refactor, test, ci, build, perf, style, revert"
+  echo "  Example:  feat: add commitlint enforcement"
+  echo ""
+  exit 1
+fi

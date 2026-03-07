@@ -43,6 +43,11 @@ review_timeout_minutes = 45        # Timeout for review-fix workflow
 trusted_users = []                 # GitHub logins that can trigger autodev via backlog/ready label
 human_reviewer = ""                # GitHub login for CODEOWNERS (auto-added by GitHub, removed from autodev PRs)
 
+[commits]
+convention = "conventional"    # Commit message format enforced by commitlint
+types = ["feat", "fix", "chore", "docs", "refactor", "test", "ci", "build", "perf", "style", "revert"]
+# Agents must use: type: description (lowercase, no scope, no trailing period)
+
 [protected_files]
 patterns = [                       # Files the agent cannot modify (reverted after each run)
     "CLAUDE.md",
