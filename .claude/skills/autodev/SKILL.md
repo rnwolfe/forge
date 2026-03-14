@@ -62,6 +62,8 @@ Validate:
 - Issue has the `backlog/ready` label (warn but proceed if missing — the user is overriding)
 - Issue is not already `agent/implementing` (abort if it is and tell the user why)
 
+**Then check if it's a parent issue** — proceed to Step 2.5.
+
 ### If no issue number was provided
 
 **Check concurrency guard first:**
@@ -102,9 +104,95 @@ gh issue list --repo $REPO \
 - Dependencies: avoid issues blocked by other open issues
 - Avoid issues with `human/blocked`, `blocked`, or `wip` labels
 
+**Before committing to any candidate, check if it's a parent issue** — proceed to Step 2.5.
+
 Present your selection with a brief rationale (1-2 sentences) before proceeding.
 Give the user a moment to redirect if they disagree — but do not wait for approval
 unless this is an interactive session. If non-interactive, proceed.
+
+---
+
+## Step 2.5 — Parent Issue Resolution
+
+Parent issues (epics) should never be implemented directly — they are umbrellas that
+decompose into implementable child issues. This step detects parent/child relationships
+and navigates to the right child to execute.
+
+### Detect child issues
+
+Search for open issues that reference the selected issue as their parent:
+
+```bash
+gh issue list --repo $REPO --state open --limit 50 \
+  --json number,title,body,labels,state \
+  --jq '[.[] | select(.body | test("\\*\\*Parent issue\\*\\*.*#'"$ISSUE_NUMBER"'"))]'
+```
+
+Also check the GitHub sub-issues API (native sub-issues):
+
+```bash
+gh api graphql -f query='
+{
+  repository(owner: "'"$OWNER"'", name: "'"$REPO_NAME"'") {
+    issue(number: '"$ISSUE_NUMBER"') {
+      subIssues(first: 50) {
+        nodes { number title state }
+      }
+    }
+  }
+}'
+```
+
+Merge results from both methods (deduplicate by issue number).
+
+### If the issue has children → navigate, don't implement
+
+**Do NOT implement the parent issue.** Instead:
+
+1. **List all child issues** with their state (open/closed) and dependency info.
+
+2. **Read each open child's Dependencies section** to build a dependency graph.
+   Dependencies are expressed as:
+   - `Depends on #N` or `- #N (description)` in a `## Dependencies` section
+   - References to sibling sub-issues by title or number
+   - `None` means no blockers
+
+3. **Identify the next implementable child** — an open child whose dependencies are
+   all satisfied (closed or merged). Apply the same selection criteria as Step 2:
+   - Has `backlog/ready` label (preferred) or is well-specified
+   - Not `agent/implementing`, `human/blocked`, `blocked`, or `wip`
+   - Concrete acceptance criteria
+   - Self-contained scope
+
+4. **If multiple children are unblocked**, pick by:
+   - Foundation layers first (issues with no dependencies, or those that unblock others)
+   - Lowest issue number as tiebreaker (usually reflects intended ordering)
+
+5. **If no children are unblocked** (all remaining open children have unsatisfied
+   dependencies), report the blockage:
+   ```
+   Parent #$ISSUE_NUMBER has N open children, but all are blocked:
+     #72 — blocked by #70 (open), #71 (open)
+     #75 — blocked by #72 (open), #73 (open), #74 (open)
+   ```
+   Stop and let the user decide.
+
+6. **Replace `$ISSUE_NUMBER`** with the selected child and continue to Step 3.
+   Log the navigation:
+   ```
+   Parent #59: "Advanced visual editing with smart selection & inpainting"
+     → Navigating to child #69: "SAM segmentation service in ai-service"
+       (foundation layer, no dependencies, backlog/ready)
+   ```
+
+### If the issue has no children → proceed normally
+
+Continue to Step 3 with the original issue.
+
+### Recursive parents
+
+If the selected child itself has children, apply this step recursively until you reach
+a leaf issue (one with no children). Leaf issues are the ones you implement.
 
 ---
 
