@@ -129,11 +129,17 @@ jobs:
               --jq '[.[] | select(.user.login != "github-actions[bot]")] | sort_by(.submitted_at) | last // empty')
 
             if [ -z "$LATEST_REVIEW" ] || [ "$LATEST_REVIEW" = "null" ]; then
-              if [ "$PHASE" = "copilot" ]; then
-                # Copilot hasn't reviewed yet — re-request in case the initial request was missed,
-                # then wait. Never skip Copilot review entirely: Copilot always reviews first,
-                # even if they have no comments (LGTM). Transition to Claude only after Copilot
-                # has actually posted a review. The 4-hour scheduled poll will check again.
+              # No formal review submission — Copilot often posts inline comments without
+              # submitting a formal review via the /reviews endpoint. Check inline comments
+              # before deciding to re-request, so the loop doesn't stall indefinitely.
+              INLINE_COUNT=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/comments" \
+                --jq '[.[] | select(.user.login != "github-actions[bot]")] | length')
+
+              if [ "$INLINE_COUNT" -gt 0 ] && [ "$PHASE" = "copilot" ] && [ "$COPILOT_ITERS" -lt 3 ]; then
+                echo "No formal review but found $INLINE_COUNT inline comment(s) on PR #$PR_NUMBER. Proceeding to copilot-fix."
+                echo "action=copilot-fix" >> "$GITHUB_OUTPUT"
+              elif [ "$PHASE" = "copilot" ]; then
+                # Truly no review activity yet — re-request and wait for next scheduled poll.
                 echo "No Copilot review found on PR #$PR_NUMBER. Re-requesting Copilot review and waiting..."
                 gh api -X POST \
                   "repos/${{ github.repository }}/pulls/$PR_NUMBER/requested_reviewers" \
