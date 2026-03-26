@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Poll a pull request's CI status until all required checks pass, any required check
 fails, or the timeout is reached. Reports the result clearly so the caller (human or
-`/loop`) can decide what to do next.
+`/forge-loop`) can decide what to do next.
 
 ## Input
 

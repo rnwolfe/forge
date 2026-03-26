@@ -9,7 +9,7 @@ disable-model-invocation: true
 Pick the highest-priority `backlog/ready` issue, label it `agent/implementing`, create the
 feature branch, and report back the issue number and branch name. Does NOT implement.
 
-Used by `/loop` to separate "what to work on next" from "do the work". Can also be run
+Used by `/forge-loop` to separate "what to work on next" from "do the work". Can also be run
 standalone to claim an issue and hand off to a human or a different agent.
 
 ## Input
@@ -92,7 +92,7 @@ Filter out issues with `agent/implementing` or `human/blocked` labels. Sort by:
 3. Lowest issue number as tiebreaker
 
 Present the top choice with a 1-sentence rationale. If running non-interactively (e.g.,
-called by `/loop`), skip the confirmation and proceed.
+called by `/forge-loop`), skip the confirmation and proceed.
 
 ---
 
@@ -142,7 +142,7 @@ git worktree add -b "$BRANCH" "$WORKTREE_PATH" origin/$BASE_BRANCH
 
 ## Step 4 — Report
 
-Print a machine-readable summary (parseable by `/loop`):
+Print a machine-readable summary (parseable by `/forge-loop`):
 
 ```
 DISPATCH_ISSUE=$ISSUE_NUMBER
@@ -158,7 +158,7 @@ Claimed #$ISSUE_NUMBER: $ISSUE_TITLE
   Branch:   $BRANCH
   Worktree: $WORKTREE_PATH
 
-Next step: run /autodev $ISSUE_NUMBER to implement, or /loop to run the full pipeline.
+Next step: run /autodev $ISSUE_NUMBER to implement, or /forge-loop to run the full pipeline.
 ```
 
 ---

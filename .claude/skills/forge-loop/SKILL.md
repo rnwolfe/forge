@@ -1,5 +1,5 @@
 ---
-name: loop
+name: forge-loop
 description: "Run the full forge pipeline end-to-end within this Claude Code session, processing multiple issues autonomously until a stop condition is met"
 disable-model-invocation: true
 ---
@@ -19,16 +19,16 @@ manages state and sequences the steps.
 `$ARGUMENTS` — flags controlling the run.
 
 ```
-/loop                               # Run until no more backlog/ready issues
-/loop --max-issues 5                # Stop after 5 issues
-/loop --max-hours 8                 # Stop after 8 hours
-/loop --issues "#42,#43,#44"        # Process specific issues in this order
-/loop --sweep                       # Run /sweep-issues before starting
-/loop --no-merge                    # Stop before merge (human merges)
-/loop --dry-run                     # Plan only: show what would run, no changes
+/forge-loop                               # Run until no more backlog/ready issues
+/forge-loop --max-issues 5                # Stop after 5 issues
+/forge-loop --max-hours 8                 # Stop after 8 hours
+/forge-loop --issues "#42,#43,#44"        # Process specific issues in this order
+/forge-loop --sweep                       # Run /sweep-issues before starting
+/forge-loop --no-merge                    # Stop before merge (human merges)
+/forge-loop --dry-run                     # Plan only: show what would run, no changes
 ```
 
-Flags can be combined: `/loop --max-hours 4 --sweep --no-merge`
+Flags can be combined: `/forge-loop --max-hours 4 --sweep --no-merge`
 
 ---
 
@@ -290,7 +290,7 @@ Failed issues:
   - #$N3: $REASON
 
 These have been labeled human/blocked. The loop state is saved at .forge/loop-state.json.
-Resume with /loop when the underlying issues are resolved.
+Resume with /forge-loop when the underlying issues are resolved.
 ```
 
 Save state and exit.
@@ -371,7 +371,7 @@ Dry-run plan — forge loop
   Stop condition: --max-issues 3
   Estimated time: 2–4 hours (at current pipeline velocity)
 
-  Run /loop --max-issues 3 to execute.
+  Run /forge-loop --max-issues 3 to execute.
 ```
 
 ---

@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Read all open review comments on a pull request, fix addressable issues, reply to each
 comment thread with what was done, and create follow-up issues for items that need
-deferral. Used by both the `/loop` pipeline and as a standalone skill for interactive
+deferral. Used by both the `/forge-loop` pipeline and as a standalone skill for interactive
 review processing.
 
 ## Input
@@ -259,7 +259,7 @@ Iteration: $NEW_ITERS / $MAX_COPILOT_ITERATIONS
 If `NEW_ITERS >= MAX_COPILOT_ITERATIONS`:
 ```
 Max Copilot iterations reached. If there are still unresolved findings, they will be
-handled in the Claude review phase. Run /loop or trigger claude-code-review.yml manually.
+handled in the Claude review phase. Run /forge-loop or trigger claude-code-review.yml manually.
 ```
 
 ---

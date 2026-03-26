@@ -7,7 +7,7 @@ disable-model-invocation: true
 # Merge PR — Final Check and Merge
 
 Perform a final pre-merge verification on a pull request and merge it if everything
-is clean. Designed to be the last step in the `/loop` pipeline, or run standalone
+is clean. Designed to be the last step in the `/forge-loop` pipeline, or run standalone
 after human review.
 
 ## Input
