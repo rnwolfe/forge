@@ -158,32 +158,12 @@ Check circuit breaker (Step 8). Then proceed to next issue.
 
 ## Step 5 — Review Loop
 
-**Copilot reviews once.** Copilot auto-reviews the PR on initial push only — it does NOT
-re-trigger on subsequent commits. Do not poll or wait for a second Copilot review after
-pushing fixes; it will never come.
+**When running locally (forge-loop), skip Copilot review entirely — rely on Claude review
+only.** Copilot takes 40–60 minutes to review and consistently arrives after merge when
+running locally. The GitHub Actions pipeline handles Copilot review asynchronously; the
+local loop does not.
 
-The review phase has two sub-phases, run in sequence:
-
-### 5a — Copilot review pass
-
-Wait up to 5 minutes for Copilot to post its initial review:
-
-```bash
-# Poll until copilot-pull-request-reviewer has submitted a review
-gh api repos/$REPO/pulls/$PR_NUMBER/reviews \
-  --jq '[.[] | select(.user.login | test("opilot"))] | length'
-```
-
-Once Copilot has reviewed (or the timeout is reached with no review — log a warning and
-proceed), run `/review-pr $PR_NUMBER` **once** to:
-- Fetch all Copilot inline comments from `gh api repos/$REPO/pulls/$PR_NUMBER/comments`
-- Fix every addressable comment
-- Reply in-thread to every comment
-- Defer out-of-scope items as follow-up issues
-
-Push fixes. Do **not** wait for Copilot to re-review — it won't.
-
-### 5b — Claude review pass
+### 5a — Claude review pass
 
 Spawn a fresh-context sub-agent (Explore type) to review the actual files changed by
 this PR. The agent should read the files directly and report issues across:
@@ -192,15 +172,14 @@ this PR. The agent should read the files directly and report issues across:
 - Error handling gaps
 - Test quality
 
-Run `/review-pr $PR_NUMBER` once more to address any issues the Claude review raises,
-reply in-thread, and push.
+Address any issues raised, push fixes.
 
 **Update state:**
 ```json
 "current": { ..., "phase": "await-ci" }
 ```
 
-**On failure:** if either review pass fails after 2 attempts, add `human/blocked`, log
+**On failure:** if the review pass fails after 2 attempts, add `human/blocked`, log
 failure, check circuit breaker, continue to next issue.
 
 ---
