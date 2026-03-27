@@ -271,5 +271,6 @@ handled in the Claude review phase. Run /forge-loop or trigger claude-code-revie
 - Never reply "done" without a specific description of what changed
 - Never create follow-up issues for already-addressed comments
 - If the PR has no open comments at all, report that and exit cleanly
-- Maximum fixes per run: determined by `max_copilot_iterations` — don't iterate
-  indefinitely on a single PR
+- **Copilot reviews once per PR** — it only posts its initial review on the first push.
+  It does NOT re-review after subsequent commits. Never poll for a second Copilot review
+  after pushing fixes; proceed directly to the Claude review pass instead.
