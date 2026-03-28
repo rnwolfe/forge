@@ -22,17 +22,20 @@ ACTION_DEST="$ROOT_DIR/.github/workflows/forge-sync.yml"
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
 DRY_RUN=false
+FORCE=false
 INIT=false
 INSTALL_ACTION=false
 for arg in "$@"; do
     case "$arg" in
         --dry-run)        DRY_RUN=true ;;
+        --force)          FORCE=true ;;
         --init)           INIT=true ;;
         --install-action) INSTALL_ACTION=true ;;
         -h|--help)
-            echo "Usage: forge-sync.sh [--dry-run] [--init] [--install-action]"
+            echo "Usage: forge-sync.sh [--dry-run] [--force] [--init] [--install-action]"
             echo ""
             echo "  --dry-run         Preview changes without applying"
+            echo "  --force           Overwrite all synced files with forge versions (no merge)"
             echo "  --init            Enroll an existing project that has no manifest yet"
             echo "  --install-action  Install weekly auto-sync GitHub Action"
             exit 0
@@ -327,22 +330,29 @@ for entry in "${CHANGED_FILES[@]}"; do
                 N_ADDED=$((N_ADDED + 1))
                 echo "  restored: $filepath"
             else
-                # True 3-way merge: ours=project, base=old forge, theirs=new forge
-                forge_old=$(mktemp)
-                git -C "$TMP/forge" show "${PINNED_COMMIT}:${filepath}" \
-                    > "$forge_old" 2>/dev/null || cp "$forge_new" "$forge_old"
-
-                if git merge-file -q "$project_file" "$forge_old" "$forge_new"; then
+                if [ "$FORCE" = true ]; then
+                    cp "$forge_new" "$project_file"
                     git add "$filepath"
                     N_UPDATED=$((N_UPDATED + 1))
-                    echo "  updated:  $filepath"
+                    echo "  updated:  $filepath (overwritten)"
                 else
-                    # git merge-file leaves conflict markers in $project_file
-                    N_CONFLICTED=$((N_CONFLICTED + 1))
-                    CONFLICTS=true
-                    echo "  conflict: $filepath"
+                    # True 3-way merge: ours=project, base=old forge, theirs=new forge
+                    forge_old=$(mktemp)
+                    git -C "$TMP/forge" show "${PINNED_COMMIT}:${filepath}" \
+                        > "$forge_old" 2>/dev/null || cp "$forge_new" "$forge_old"
+
+                    if git merge-file -q "$project_file" "$forge_old" "$forge_new"; then
+                        git add "$filepath"
+                        N_UPDATED=$((N_UPDATED + 1))
+                        echo "  updated:  $filepath"
+                    else
+                        # git merge-file leaves conflict markers in $project_file
+                        N_CONFLICTED=$((N_CONFLICTED + 1))
+                        CONFLICTS=true
+                        echo "  conflict: $filepath"
+                    fi
+                    rm -f "$forge_old"
                 fi
-                rm -f "$forge_old"
             fi
             ;;
         D)
