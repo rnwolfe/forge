@@ -81,8 +81,10 @@ Bootstrap with a single command:
 curl -fsSL https://raw.githubusercontent.com/rnwolfe/forge/main/setup/bootstrap.sh | bash
 ```
 
-This downloads `forge-sync.sh`, pins your project to the current forge HEAD, and sets up
-`.forge/manifest.json`. From that point forward, `forge-sync` works normally.
+This downloads `forge-sync.sh` and runs `--init`, which diffs forge's entire history
+against your project and applies everything missing — new skills, updated scripts, new
+workflows. Existing files you've modified are 3-way merged, so local changes are
+preserved where possible.
 
 ### Automatic weekly sync (optional)
 

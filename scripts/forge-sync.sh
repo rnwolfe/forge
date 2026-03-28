@@ -84,19 +84,32 @@ if [ "$INIT" = true ]; then
     done
 
     TEMPLATE_REPO="rnwolfe/forge"
-    echo "Fetching current forge HEAD..."
-    CURRENT_COMMIT=$(gh api "repos/$TEMPLATE_REPO/commits/main" --jq '.sha' 2>/dev/null) || {
-        echo "Error: Could not reach $TEMPLATE_REPO via gh API." >&2
-        echo "Make sure gh is authenticated: gh auth status" >&2
+
+    # Clone forge so we can find its first commit and run the initial sync
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT
+
+    echo "Fetching forge template..."
+    CLONE_ERR=$(mktemp)
+    if ! git clone --quiet --filter=blob:none \
+            "https://github.com/$TEMPLATE_REPO.git" "$TMP/forge" 2>"$CLONE_ERR"; then
+        echo "Error: failed to clone $TEMPLATE_REPO." >&2
+        cat "$CLONE_ERR" >&2
         exit 1
-    }
+    fi
+
+    # Pin to the first-ever forge commit so the sync brings in everything
+    GENESIS_COMMIT=$(git -C "$TMP/forge" rev-list --max-parents=0 HEAD)
+    LATEST_COMMIT=$(git -C "$TMP/forge" rev-parse HEAD)
+    GENESIS_SHORT="${GENESIS_COMMIT:0:7}"
+    LATEST_SHORT="${LATEST_COMMIT:0:7}"
 
     SYNCED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     mkdir -p "$(dirname "$MANIFEST")"
     cat > "$MANIFEST" <<EOF
 {
   "template": "$TEMPLATE_REPO",
-  "commit": "$CURRENT_COMMIT",
+  "commit": "$GENESIS_COMMIT",
   "synced_at": "$SYNCED_AT",
   "synced_paths": [
     ".claude/skills/",
@@ -112,15 +125,15 @@ if [ "$INIT" = true ]; then
 }
 EOF
 
-    echo "Initialized: .forge/manifest.json (pinned to forge @ ${CURRENT_COMMIT:0:7})"
+    echo "Initialized: .forge/manifest.json"
+    echo "Syncing all forge changes from $GENESIS_SHORT → $LATEST_SHORT..."
     echo ""
-    echo "This pins your project to the current forge HEAD. Future runs of"
-    echo "forge-sync will apply only changes made after today."
-    echo ""
-    echo "Next steps:"
-    echo "  git add .forge/manifest.json"
-    echo "  git commit -m 'chore: enroll in forge-sync'"
-    exit 0
+
+    # Run the sync immediately so missing files are added now.
+    # Re-exec without --init so it goes through the normal sync path.
+    # Clean up TMP first — the trap won't fire after exec.
+    rm -rf "$TMP"
+    exec "$0"
 fi
 
 # ── Validate prerequisites ───────────────────────────────────────────────────
