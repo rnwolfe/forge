@@ -1,0 +1,76 @@
+# forge-sync-action.yml — Weekly auto-sync from upstream forge template
+#
+# This is a TEMPLATE, not an active workflow. To activate it, run:
+#
+#   ./scripts/forge-sync.sh --install-action
+#
+# That copies this file to .github/workflows/forge-sync.yml.
+# Commit and push to enable the weekly sync job.
+#
+# What it does:
+#   Runs every Monday (or on demand), checks whether the upstream forge
+#   template has changed since your last sync, and opens a PR with the diff
+#   so you can review and merge at your own pace.
+
+name: Sync Forge Template
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'   # Every Monday 9 AM UTC
+  workflow_dispatch:        # Or trigger manually via Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Run forge-sync
+        id: sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ./scripts/forge-sync.sh > /tmp/sync-output.txt 2>&1 || {
+            echo "forge-sync failed:" >&2
+            cat /tmp/sync-output.txt >&2
+            exit 1
+          }
+          cat /tmp/sync-output.txt
+          if grep -q "Already up to date" /tmp/sync-output.txt; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open pull request
+        if: steps.sync.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: sync forge template updates"
+          branch: forge-sync/automated-update
+          title: "chore: sync forge template updates"
+          body: |
+            Automated sync from the [forge](https://github.com/rnwolfe/forge) template.
+
+            Review the changed files below and merge to adopt the latest pipeline improvements.
+
+            To preview locally before merging:
+            ```
+            ./scripts/forge-sync.sh --dry-run
+            ```
+          labels: chore
+          delete-branch: true
