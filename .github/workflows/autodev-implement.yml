@@ -213,34 +213,42 @@ jobs:
           echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
 
-      - name: Wait for review and trigger review pipeline
+      - name: Trigger review pipeline
         if: steps.agent.outcome == 'success' && steps.changes.outputs.has_changes == 'true' && steps.create-pr.outputs.pr_number
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           PR_NUMBER="${{ steps.create-pr.outputs.pr_number }}"
-          echo "Waiting for Copilot review on PR #$PR_NUMBER..."
 
-          for i in $(seq 1 60); do
+          # Fast-path poll: wait up to 2 minutes for Copilot to begin reviewing.
+          # Checks both formal reviews (/reviews) and inline-only comments (/comments),
+          # since Copilot sometimes posts inline comments without a formal review submission.
+          # Either way we dispatch immediately; review-fix handles the case where it
+          # needs to re-request or wait.
+          echo "Waiting up to 2 minutes for Copilot to begin reviewing PR #$PR_NUMBER..."
+          for i in $(seq 1 12); do
             REVIEW_COUNT=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" \
               --jq '[.[] | select(.user.login != "github-actions[bot]")] | length' 2>/dev/null || echo "0")
+            COMMENT_COUNT=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/comments" \
+              --jq '[.[] | select(.user.login != "github-actions[bot]")] | length' 2>/dev/null || echo "0")
 
-            if [ "$REVIEW_COUNT" -gt 0 ]; then
-              echo "Review found after ~$((i * 10))s. Dispatching review-fix pipeline."
-              if gh workflow run autodev-review-fix.yml \
-                --repo "${{ github.repository }}" \
-                -f pr_number="$PR_NUMBER"; then
-                echo "Review-fix pipeline dispatched for PR #$PR_NUMBER."
-              else
-                echo "::warning::Failed to dispatch review-fix. The scheduled fallback will process this PR."
-              fi
-              exit 0
+            if [ "$REVIEW_COUNT" -gt 0 ] || [ "$COMMENT_COUNT" -gt 0 ]; then
+              echo "Review activity found after ~$((i * 10))s."
+              break
             fi
-
             sleep 10
           done
 
-          echo "::warning::No review appeared within 10 minutes. Review pipeline will rely on scheduled fallback."
+          # Always dispatch review-fix regardless of whether Copilot has reviewed yet.
+          # If no review exists, review-fix will re-request it and the scheduled fallback
+          # will process it when Copilot responds.
+          if gh workflow run autodev-review-fix.yml \
+            --repo "${{ github.repository }}" \
+            -f pr_number="$PR_NUMBER"; then
+            echo "Review-fix pipeline dispatched for PR #$PR_NUMBER."
+          else
+            echo "::warning::Failed to dispatch review-fix. The scheduled fallback will process this PR."
+          fi
 
       - name: Handle no changes
         if: steps.agent.outcome == 'success' && steps.changes.outputs.has_changes == 'false'

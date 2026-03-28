@@ -159,8 +159,18 @@ AUTODEV_LABEL_PRIORITY_HIGH="priority/high"
 AUTODEV_LABEL_PIPELINE_AUDIT="report/pipeline-audit"
 
 # Limits
-AUTODEV_MAX_ITERATIONS="$(_forge_toml "gating" "max_copilot_iterations")"
-AUTODEV_MAX_ITERATIONS="${AUTODEV_MAX_ITERATIONS:-3}"
+AUTODEV_MAX_COPILOT_ITERATIONS="$(_forge_toml "gating" "max_copilot_iterations")"
+AUTODEV_MAX_COPILOT_ITERATIONS="${AUTODEV_MAX_COPILOT_ITERATIONS:-3}"
+# Legacy alias — prefer AUTODEV_MAX_COPILOT_ITERATIONS in new code
+AUTODEV_MAX_ITERATIONS="$AUTODEV_MAX_COPILOT_ITERATIONS"
+
+# Loop config
+FORGE_LOOP_MAX_FAILURES="$(_forge_toml "loop" "max_failures_before_stop")"
+FORGE_LOOP_MAX_FAILURES="${FORGE_LOOP_MAX_FAILURES:-3}"
+FORGE_LOOP_CI_POLL_MINUTES="$(_forge_toml "loop" "ci_poll_interval_minutes")"
+FORGE_LOOP_CI_POLL_MINUTES="${FORGE_LOOP_CI_POLL_MINUTES:-5}"
+FORGE_LOOP_CI_TIMEOUT_MINUTES="$(_forge_toml "loop" "ci_timeout_minutes")"
+FORGE_LOOP_CI_TIMEOUT_MINUTES="${FORGE_LOOP_CI_TIMEOUT_MINUTES:-60}"
 
 # Trusted users who can trigger autodev via backlog/ready label.
 # Read from forge.toml; always include bot actors.

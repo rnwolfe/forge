@@ -55,3 +55,20 @@ patterns = [                       # Files the agent cannot modify (reverted aft
     "scripts/autodev/",
     "forge.toml",
 ]
+
+[loop]
+# Configuration for the /loop skill — end-to-end autonomous development loop
+max_concurrent_issues = 1          # Issues in flight simultaneously (pipeline parallelism, future)
+max_failures_before_stop = 3       # Circuit breaker: stop after N consecutive failures
+ci_poll_interval_minutes = 5       # How often to re-check CI status while waiting
+ci_timeout_minutes = 60            # Max time to wait for CI before marking blocked
+
+[steps]
+# Per-step provider/model overrides. Defaults to [agent] settings if not set.
+# Useful for cost optimization (cheaper model for review) or provider routing.
+# implement_provider = "claude"
+# implement_model = "claude-opus-4-6"
+# review_provider = "claude"
+# review_model = "claude-sonnet-4-6"
+# sweep_provider = "claude"
+# sweep_model = "claude-haiku-4-5"
