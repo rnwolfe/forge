@@ -30,13 +30,15 @@ cd "$ROOT_DIR"
 # ── Download forge-sync.sh ───────────────────────────────────────────────────
 mkdir -p scripts
 
-if command -v curl &>/dev/null; then
-    curl -fsSL "$FORGE_RAW/$SCRIPT_DEST" -o "$SCRIPT_DEST"
-elif command -v gh &>/dev/null; then
+# Prefer gh API over curl — gh hits the GitHub API directly and is never
+# served from CDN cache, so it always returns the latest committed content.
+if command -v gh &>/dev/null; then
     gh api "repos/$FORGE_REPO/contents/$SCRIPT_DEST" --jq '.content' \
         | base64 -d > "$SCRIPT_DEST"
+elif command -v curl &>/dev/null; then
+    curl -fsSL "$FORGE_RAW/$SCRIPT_DEST" -o "$SCRIPT_DEST"
 else
-    echo "Error: curl or gh is required to download forge-sync.sh." >&2
+    echo "Error: gh or curl is required to download forge-sync.sh." >&2
     exit 1
 fi
 
