@@ -8,6 +8,7 @@
 # Usage:
 #   ./scripts/forge-sync.sh                  # Apply updates from latest forge
 #   ./scripts/forge-sync.sh --dry-run        # Preview changes without applying
+#   ./scripts/forge-sync.sh --init           # Enroll an existing project (no manifest yet)
 #   ./scripts/forge-sync.sh --install-action # Install weekly auto-sync GitHub Action
 #
 # Requires: git, gh (GitHub CLI), jq
@@ -21,15 +22,18 @@ ACTION_DEST="$ROOT_DIR/.github/workflows/forge-sync.yml"
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
 DRY_RUN=false
+INIT=false
 INSTALL_ACTION=false
 for arg in "$@"; do
     case "$arg" in
         --dry-run)        DRY_RUN=true ;;
+        --init)           INIT=true ;;
         --install-action) INSTALL_ACTION=true ;;
         -h|--help)
-            echo "Usage: forge-sync.sh [--dry-run] [--install-action]"
+            echo "Usage: forge-sync.sh [--dry-run] [--init] [--install-action]"
             echo ""
             echo "  --dry-run         Preview changes without applying"
+            echo "  --init            Enroll an existing project that has no manifest yet"
             echo "  --install-action  Install weekly auto-sync GitHub Action"
             exit 0
             ;;
@@ -55,6 +59,69 @@ if [ "$INSTALL_ACTION" = true ]; then
     exit 0
 fi
 
+# ── Init: enroll an existing project ────────────────────────────────────────
+if [ "$INIT" = true ]; then
+    if [ -f "$MANIFEST" ]; then
+        EXISTING_COMMIT=$(jq -r '.commit' "$MANIFEST" 2>/dev/null || true)
+        if [ -n "$EXISTING_COMMIT" ] && [ "$EXISTING_COMMIT" != "null" ] && [ "$EXISTING_COMMIT" != "" ]; then
+            echo "Already initialized (.forge/manifest.json exists with commit ${EXISTING_COMMIT:0:7})."
+            echo "Run ./scripts/forge-sync.sh to check for updates."
+            exit 0
+        fi
+    fi
+
+    # Prereqs for init
+    for cmd in gh jq; do
+        if ! command -v "$cmd" &>/dev/null; then
+            echo "Error: $cmd is required but not installed." >&2
+            case "$cmd" in
+                gh) echo "  Install: https://cli.github.com" >&2 ;;
+                jq) echo "  Install: https://jqlang.github.io/jq/download/" >&2 ;;
+            esac
+            exit 1
+        fi
+    done
+
+    TEMPLATE_REPO="rnwolfe/forge"
+    echo "Fetching current forge HEAD..."
+    CURRENT_COMMIT=$(gh api "repos/$TEMPLATE_REPO/commits/main" --jq '.sha' 2>/dev/null) || {
+        echo "Error: Could not reach $TEMPLATE_REPO via gh API." >&2
+        echo "Make sure gh is authenticated: gh auth status" >&2
+        exit 1
+    }
+
+    SYNCED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    mkdir -p "$(dirname "$MANIFEST")"
+    cat > "$MANIFEST" <<EOF
+{
+  "template": "$TEMPLATE_REPO",
+  "commit": "$CURRENT_COMMIT",
+  "synced_at": "$SYNCED_AT",
+  "synced_paths": [
+    ".claude/skills/",
+    ".claude/settings.json",
+    "scripts/autodev/",
+    ".github/workflows/autodev-dispatch.yml",
+    ".github/workflows/autodev-implement.yml",
+    ".github/workflows/autodev-review-fix.yml",
+    ".github/workflows/claude-code-review.yml",
+    ".github/workflows/autodev-audit.yml",
+    "setup/"
+  ]
+}
+EOF
+
+    echo "Initialized: .forge/manifest.json (pinned to forge @ ${CURRENT_COMMIT:0:7})"
+    echo ""
+    echo "This pins your project to the current forge HEAD. Future runs of"
+    echo "forge-sync will apply only changes made after today."
+    echo ""
+    echo "Next steps:"
+    echo "  git add .forge/manifest.json"
+    echo "  git commit -m 'chore: enroll in forge-sync'"
+    exit 0
+fi
+
 # ── Validate prerequisites ───────────────────────────────────────────────────
 for cmd in git gh jq; do
     if ! command -v "$cmd" &>/dev/null; then
@@ -71,7 +138,11 @@ if [ ! -f "$MANIFEST" ]; then
     cat >&2 <<'EOF'
 Error: .forge/manifest.json not found.
 
-Run /onboard to initialize it, or create it manually:
+If this project was scaffolded from forge before forge-sync existed, run:
+  ./scripts/forge-sync.sh --init
+
+For new projects, run /onboard (it writes the manifest automatically).
+Or create it manually:
 
   mkdir -p .forge && cat > .forge/manifest.json <<JSON
   {
