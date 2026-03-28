@@ -248,15 +248,19 @@ if ! git -C "$TMP/forge" cat-file -e "${PINNED_COMMIT}^{commit}" 2>/dev/null; th
     exit 1
 fi
 
-# ── Generate diff ────────────────────────────────────────────────────────────
+# ── Collect changed files ────────────────────────────────────────────────────
 mapfile -t SYNCED_PATHS < <(jq -r '.synced_paths[]' "$MANIFEST")
 
 echo "Diffing: ${SYNCED_PATHS[*]}"
 echo ""
 
-PATCH=$(git -C "$TMP/forge" diff "$PINNED_COMMIT" HEAD -- "${SYNCED_PATHS[@]}" 2>/dev/null || true)
+# --no-renames: treat renames as delete+add, keeps status parsing simple
+mapfile -t CHANGED_FILES < <(
+    git -C "$TMP/forge" diff --name-status --no-renames \
+        "$PINNED_COMMIT" HEAD -- "${SYNCED_PATHS[@]}" 2>/dev/null || true
+)
 
-if [ -z "$PATCH" ]; then
+if [ ${#CHANGED_FILES[@]} -eq 0 ]; then
     echo "No changes in synced paths between $PINNED_SHORT and $LATEST_SHORT."
     if [ "$DRY_RUN" = false ]; then
         UPDATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -271,42 +275,82 @@ fi
 
 # ── Dry run ──────────────────────────────────────────────────────────────────
 if [ "$DRY_RUN" = true ]; then
-    echo "--- Diff preview ($PINNED_SHORT → $LATEST_SHORT) ---"
+    echo "--- Changes ($PINNED_SHORT → $LATEST_SHORT) ---"
     echo ""
-    echo "$PATCH"
+    for entry in "${CHANGED_FILES[@]}"; do
+        status=$(printf '%s' "$entry" | cut -f1)
+        filepath=$(printf '%s' "$entry" | cut -f2)
+        case "${status:0:1}" in
+            A) echo "  [add]    $filepath" ;;
+            M) echo "  [update] $filepath" ;;
+            D) echo "  [skip]   $filepath  (deleted upstream, kept locally)" ;;
+            *) echo "  [?]      $filepath  ($status)" ;;
+        esac
+    done
+    echo ""
+    echo "Run without --dry-run to apply."
     exit 0
 fi
 
-# ── Apply patch ──────────────────────────────────────────────────────────────
+# ── Apply changes file by file ───────────────────────────────────────────────
+# Uses git merge-file for modified files — a true 3-way merge that works
+# without the base blobs being present in the target repo's object store.
 echo "Applying changes..."
 cd "$ROOT_DIR"
 
-APPLY_ERR=$(mktemp)
 CONFLICTS=false
-HARD_FAIL=false
+N_ADDED=0
+N_UPDATED=0
+N_CONFLICTED=0
 
-if echo "$PATCH" | git apply --3way --index - 2>"$APPLY_ERR"; then
-    echo "Changes applied cleanly."
-else
-    # Distinguish conflicts (markers left in working tree) from hard failure
-    # (patch doesn't apply at all — wrong paths, binary mismatch, etc.)
-    if git ls-files --unmerged | grep -q .; then
-        echo ""
-        echo "Warning: Some hunks had conflicts and were left with conflict markers."
-        echo "Resolve them, then stage all files and commit."
-        CONFLICTS=true
-    else
-        echo "Error: patch failed to apply." >&2
-        cat "$APPLY_ERR" >&2
-        HARD_FAIL=true
-    fi
-fi
+for entry in "${CHANGED_FILES[@]}"; do
+    status=$(printf '%s' "$entry" | cut -f1)
+    filepath=$(printf '%s' "$entry" | cut -f2)
+    forge_new="$TMP/forge/$filepath"
+    project_file="$ROOT_DIR/$filepath"
 
-if [ "$HARD_FAIL" = true ]; then
-    echo "" >&2
-    echo "Manifest was not updated. Fix the issue above and re-run forge-sync." >&2
-    exit 1
-fi
+    case "${status:0:1}" in
+        A)
+            # New file in forge — copy directly
+            mkdir -p "$(dirname "$project_file")"
+            cp "$forge_new" "$project_file"
+            git add "$filepath"
+            N_ADDED=$((N_ADDED + 1))
+            echo "  added:    $filepath"
+            ;;
+        M)
+            if [ ! -f "$project_file" ]; then
+                # File was deleted locally — restore from forge
+                mkdir -p "$(dirname "$project_file")"
+                cp "$forge_new" "$project_file"
+                git add "$filepath"
+                N_ADDED=$((N_ADDED + 1))
+                echo "  restored: $filepath"
+            else
+                # True 3-way merge: ours=project, base=old forge, theirs=new forge
+                forge_old=$(mktemp)
+                git -C "$TMP/forge" show "${PINNED_COMMIT}:${filepath}" \
+                    > "$forge_old" 2>/dev/null || cp "$forge_new" "$forge_old"
+
+                if git merge-file -q "$project_file" "$forge_old" "$forge_new"; then
+                    git add "$filepath"
+                    N_UPDATED=$((N_UPDATED + 1))
+                    echo "  updated:  $filepath"
+                else
+                    # git merge-file leaves conflict markers in $project_file
+                    N_CONFLICTED=$((N_CONFLICTED + 1))
+                    CONFLICTS=true
+                    echo "  conflict: $filepath"
+                fi
+                rm -f "$forge_old"
+            fi
+            ;;
+        D)
+            # Deleted upstream — leave the local file alone
+            echo "  skipped:  $filepath  (removed from forge, kept locally)"
+            ;;
+    esac
+done
 
 # ── Update manifest ──────────────────────────────────────────────────────────
 UPDATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -320,11 +364,12 @@ git add "$MANIFEST"
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "forge-sync: $PINNED_SHORT → $LATEST_SHORT"
+echo "  $N_ADDED added, $N_UPDATED updated, $N_CONFLICTED conflicted"
 echo ""
 
 if [ "$CONFLICTS" = true ]; then
     echo "Next steps:"
-    echo "  1. Resolve merge conflicts (search for <<<<<<< in modified files)"
+    echo "  1. Resolve conflicts (search for <<<<<<< in the files listed above)"
     echo "  2. git add -A"
     echo "  3. git commit -m 'chore: sync forge template updates'"
 else
