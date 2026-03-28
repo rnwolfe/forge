@@ -50,6 +50,7 @@ if [ "$INSTALL_ACTION" = true ]; then
         echo "forge-sync GitHub Action is already installed at $ACTION_DEST"
         exit 0
     fi
+    mkdir -p "$(dirname "$ACTION_DEST")"
     cp "$ACTION_TEMPLATE" "$ACTION_DEST"
     echo "Installed: $ACTION_DEST"
     echo ""
@@ -218,8 +219,13 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 echo "Fetching forge template..."
-git clone --quiet --filter=blob:none \
-    "https://github.com/$TEMPLATE_REPO.git" "$TMP/forge" 2>/dev/null
+CLONE_ERR=$(mktemp)
+if ! git clone --quiet --filter=blob:none \
+        "https://github.com/$TEMPLATE_REPO.git" "$TMP/forge" 2>"$CLONE_ERR"; then
+    echo "Error: failed to clone $TEMPLATE_REPO." >&2
+    cat "$CLONE_ERR" >&2
+    exit 1
+fi
 
 # Verify the pinned commit exists in the cloned repo
 if ! git -C "$TMP/forge" cat-file -e "${PINNED_COMMIT}^{commit}" 2>/dev/null; then
@@ -262,14 +268,31 @@ fi
 echo "Applying changes..."
 cd "$ROOT_DIR"
 
+APPLY_ERR=$(mktemp)
 CONFLICTS=false
-if echo "$PATCH" | git apply --3way - 2>/dev/null; then
+HARD_FAIL=false
+
+if echo "$PATCH" | git apply --3way --index - 2>"$APPLY_ERR"; then
     echo "Changes applied cleanly."
 else
-    echo ""
-    echo "Warning: Some hunks had conflicts and were left with conflict markers."
-    echo "Resolve them before committing."
-    CONFLICTS=true
+    # Distinguish conflicts (markers left in working tree) from hard failure
+    # (patch doesn't apply at all — wrong paths, binary mismatch, etc.)
+    if git ls-files --unmerged | grep -q .; then
+        echo ""
+        echo "Warning: Some hunks had conflicts and were left with conflict markers."
+        echo "Resolve them, then stage all files and commit."
+        CONFLICTS=true
+    else
+        echo "Error: patch failed to apply." >&2
+        cat "$APPLY_ERR" >&2
+        HARD_FAIL=true
+    fi
+fi
+
+if [ "$HARD_FAIL" = true ]; then
+    echo "" >&2
+    echo "Manifest was not updated. Fix the issue above and re-run forge-sync." >&2
+    exit 1
 fi
 
 # ── Update manifest ──────────────────────────────────────────────────────────
@@ -279,6 +302,7 @@ jq --arg commit "$LATEST_COMMIT" --arg ts "$UPDATED_AT" \
     '.commit = $commit | .synced_at = $ts' \
     "$MANIFEST" > "$TMP_MANIFEST"
 mv "$TMP_MANIFEST" "$MANIFEST"
+git add "$MANIFEST"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
@@ -293,6 +317,5 @@ if [ "$CONFLICTS" = true ]; then
 else
     echo "Next steps:"
     echo "  1. Review: git diff --cached"
-    echo "  2. git add .forge/manifest.json"
-    echo "  3. git commit -m 'chore: sync forge template updates'"
+    echo "  2. git commit -m 'chore: sync forge template updates'"
 fi

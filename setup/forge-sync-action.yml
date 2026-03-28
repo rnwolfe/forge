@@ -32,21 +32,27 @@ jobs:
           fetch-depth: 0
 
       - name: Install jq
-        run: sudo apt-get install -y jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
 
       - name: Run forge-sync
         id: sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if ./scripts/forge-sync.sh 2>&1 | tee /tmp/sync-output.txt; then
-            if grep -q "Already up to date" /tmp/sync-output.txt; then
-              echo "changed=false" >> "$GITHUB_OUTPUT"
-            else
-              echo "changed=true" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "Sync failed:" >&2
+          set -euo pipefail
+          ./scripts/forge-sync.sh > /tmp/sync-output.txt 2>&1 || {
+            echo "forge-sync failed:" >&2
             cat /tmp/sync-output.txt >&2
             exit 1
+          }
+          cat /tmp/sync-output.txt
+          if grep -q "Already up to date" /tmp/sync-output.txt; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Open pull request
