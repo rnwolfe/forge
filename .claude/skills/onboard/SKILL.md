@@ -158,6 +158,46 @@ Phases 1-4 work fine without a remote.
 
 If a remote already exists and points to the right repo, confirm and move on.
 
+### Forge Manifest
+
+After the git history and remote steps above, initialize `.forge/manifest.json` so
+`forge-sync` knows which version of the template this project was scaffolded from.
+
+Fetch the current HEAD commit of the forge template:
+
+```bash
+gh api repos/rnwolfe/forge/commits/main --jq '.sha'
+```
+
+Then write `.forge/manifest.json` with that commit SHA:
+
+```bash
+# FORGE_COMMIT is the sha returned above
+cat > .forge/manifest.json <<EOF
+{
+  "template": "rnwolfe/forge",
+  "commit": "$FORGE_COMMIT",
+  "synced_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "synced_paths": [
+    ".claude/skills/",
+    ".claude/settings.json",
+    "scripts/autodev/",
+    ".github/workflows/autodev-dispatch.yml",
+    ".github/workflows/autodev-implement.yml",
+    ".github/workflows/autodev-review-fix.yml",
+    ".github/workflows/claude-code-review.yml",
+    ".github/workflows/autodev-audit.yml",
+    "setup/"
+  ]
+}
+EOF
+```
+
+If `gh` is not available yet, skip this step — the user can run `/onboard --verify`
+after installing `gh`, or create `.forge/manifest.json` manually.
+
+**Commit**: `git add .forge/manifest.json && git commit -m "chore: initialize forge sync manifest"`
+
 ---
 
 ## Reconfiguration Modes
@@ -812,6 +852,11 @@ Manual (you need to do these):
        - Watch the pipeline pick it up (or manually trigger autodev-dispatch)
        - Review and merge the resulting PR
        - Delete the test issue after verification
+
+  [ ] 7. (Optional) Enable automatic forge template syncing
+       - Run: ./scripts/forge-sync.sh --install-action
+       - Commit and push the generated .github/workflows/forge-sync.yml
+       - This opens a weekly PR whenever forge has upstream updates
 ```
 
 ### Verification

@@ -1,0 +1,16 @@
+{
+  "template": "rnwolfe/forge",
+  "commit": "",
+  "synced_at": null,
+  "synced_paths": [
+    ".claude/skills/",
+    ".claude/settings.json",
+    "scripts/autodev/",
+    ".github/workflows/autodev-dispatch.yml",
+    ".github/workflows/autodev-implement.yml",
+    ".github/workflows/autodev-review-fix.yml",
+    ".github/workflows/claude-code-review.yml",
+    ".github/workflows/autodev-audit.yml",
+    "setup/"
+  ]
+}
