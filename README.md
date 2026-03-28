@@ -58,6 +58,46 @@ days, checkpointing state between issues so it can resume if interrupted.
 4. **Label it `backlog/ready`** — the pipeline picks it up within an hour, or run it
    immediately with `/autodev` or `/loop`
 
+## Keeping Up to Date
+
+As forge improves, you can pull the latest skills, autodev scripts, and workflow fixes into
+any project that was scaffolded from it.
+
+### New projects
+
+`/onboard` writes `.forge/manifest.json` automatically, recording the forge commit your
+project was scaffolded from. To sync:
+
+```bash
+./scripts/forge-sync.sh              # apply latest forge updates
+./scripts/forge-sync.sh --dry-run    # preview the diff first
+```
+
+### Existing projects (scaffolded before forge-sync)
+
+Bootstrap with a single command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rnwolfe/forge/main/setup/bootstrap.sh | bash
+```
+
+This downloads `forge-sync.sh`, pins your project to the current forge HEAD, and sets up
+`.forge/manifest.json`. From that point forward, `forge-sync` works normally.
+
+### Automatic weekly sync (optional)
+
+To have a PR opened automatically whenever forge has upstream changes:
+
+```bash
+./scripts/forge-sync.sh --install-action
+git add .github/workflows/forge-sync.yml
+git commit -m "ci: add weekly forge template sync"
+```
+
+**What gets synced**: `.claude/skills/`, `scripts/autodev/`, and the five forge-owned
+workflows. **Never touched**: `forge.toml`, `CLAUDE.md`, `VISION.md`, `ci.yml`, or
+anything else project-specific.
+
 ## Configuration
 
 All pipeline settings live in `forge.toml`:
