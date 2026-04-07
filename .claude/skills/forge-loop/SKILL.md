@@ -158,21 +158,64 @@ Check circuit breaker (Step 8). Then proceed to next issue.
 
 ## Step 5 — Review Loop
 
-**When running locally (forge-loop), skip Copilot review entirely — rely on Claude review
-only.** Copilot takes 40–60 minutes to review and consistently arrives after merge when
-running locally. The GitHub Actions pipeline handles Copilot review asynchronously; the
-local loop does not.
+Two-phase review: a sub-agent posts review comments on the PR, then the main thread
+addresses them. This replaces waiting for Copilot (which takes 40–60 minutes and
+consistently arrives after merge in local runs).
 
-### 5a — Claude review pass
+### 5a — Sub-agent review
 
-Spawn a fresh-context sub-agent (Explore type) to review the actual files changed by
-this PR. The agent should read the files directly and report issues across:
-- Correctness and logic errors
-- Security (XSS, injection, path traversal, DoS vectors)
-- Error handling gaps
-- Test quality
+Spawn a fresh-context sub-agent (general-purpose) to perform and **post** a code review
+directly on the PR. The sub-agent should:
 
-Address any issues raised, push fixes.
+1. Read the PR diff: `gh pr diff $PR_NUMBER --repo $REPO`
+2. Read the full content of every changed file (not just the diff hunks)
+3. Review for:
+   - Correctness and logic errors
+   - Security (XSS, injection, path traversal, DoS vectors)
+   - Error handling gaps
+   - Test quality and coverage
+   - Adherence to project conventions from `CLAUDE.md`
+4. **Post findings as inline PR review comments** using the GitHub API. To make the
+   API call actionable, first compute a stable diff anchor for each finding:
+   - Get the PR head SHA: `PR_HEAD_SHA=$(gh pr view $PR_NUMBER --repo $REPO --json headRefOid --jq .headRefOid)`
+   - For each finding, map it to the changed file and the exact changed line in the PR diff.
+     Parse the relevant hunk header from `gh pr diff` (`@@ -old_start,old_count +new_start,new_count @@`)
+     and count subsequent diff lines within that hunk:
+     - lines beginning with `+` (but not `+++`) exist on the `RIGHT` side and increment the new-file line number
+     - lines beginning with `-` (but not `---`) exist on the `LEFT` side and increment the old-file line number
+     - context lines beginning with a space exist on both sides and increment both counters
+   - Prefer the newer review comment fields `line` and `side` instead of legacy `position`.
+     For comments on added/modified code in the PR, use the destination file line number with `side=RIGHT`.
+     Only comment inline on lines that are part of the diff. If a finding cannot be anchored to a changed
+     line, post it as a regular non-inline review body comment instead of inventing a position.
+   - Include the commit being reviewed when creating the review so comments are anchored to the current PR head.
+   Example for a single inline finding on an added line:
+   ```bash
+   PR_HEAD_SHA=$(gh pr view $PR_NUMBER --repo $REPO --json headRefOid --jq .headRefOid)
+
+   gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+     -X POST \
+     -f commit_id="$PR_HEAD_SHA" \
+     -f event="COMMENT" \
+     -f body="Review by forge-loop sub-agent" \
+     -f 'comments[][path]=<file>' \
+     -f 'comments[0][path]=<file>' \
+     -f 'comments[0][position]=<diff position>' \
+     -f 'comments[0][body]=<finding>'
+   looks clean.
+5. Return a summary: count of findings by severity, and whether any are blocking.
+
+The sub-agent must NOT modify any files — it only reads and posts comments.
+
+### 5b — Address review findings
+
+The main thread (orchestrator) processes the sub-agent's findings:
+
+1. Run `/review-pr $PR_NUMBER` to read the posted comments, fix addressable issues,
+   reply in-thread, and create follow-up issues for deferred items.
+2. Push fixes if any were made.
+
+### 5c — Update state
 
 **Update state:**
 ```json
