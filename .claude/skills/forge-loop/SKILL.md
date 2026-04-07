@@ -199,9 +199,9 @@ directly on the PR. The sub-agent should:
      -f event="COMMENT" \
      -f body="Review by forge-loop sub-agent" \
      -f 'comments[][path]=<file>' \
-     -f 'comments[][line]=<line in new file from diff hunk>' \
-     -f 'comments[][side]=RIGHT' \
-     -f 'comments[][body]=<finding>'
+     -f 'comments[0][path]=<file>' \
+     -f 'comments[0][position]=<diff position>' \
+     -f 'comments[0][body]=<finding>'
    looks clean.
 5. Return a summary: count of findings by severity, and whether any are blocking.
 
