@@ -158,21 +158,49 @@ Check circuit breaker (Step 8). Then proceed to next issue.
 
 ## Step 5 — Review Loop
 
-**When running locally (forge-loop), skip Copilot review entirely — rely on Claude review
-only.** Copilot takes 40–60 minutes to review and consistently arrives after merge when
-running locally. The GitHub Actions pipeline handles Copilot review asynchronously; the
-local loop does not.
+Two-phase review: a sub-agent posts review comments on the PR, then the main thread
+addresses them. This replaces waiting for Copilot (which takes 40–60 minutes and
+consistently arrives after merge in local runs).
 
-### 5a — Claude review pass
+### 5a — Sub-agent review
 
-Spawn a fresh-context sub-agent (Explore type) to review the actual files changed by
-this PR. The agent should read the files directly and report issues across:
-- Correctness and logic errors
-- Security (XSS, injection, path traversal, DoS vectors)
-- Error handling gaps
-- Test quality
+Spawn a fresh-context sub-agent (general-purpose) to perform and **post** a code review
+directly on the PR. The sub-agent should:
 
-Address any issues raised, push fixes.
+1. Read the PR diff: `gh pr diff $PR_NUMBER --repo $REPO`
+2. Read the full content of every changed file (not just the diff hunks)
+3. Review for:
+   - Correctness and logic errors
+   - Security (XSS, injection, path traversal, DoS vectors)
+   - Error handling gaps
+   - Test quality and coverage
+   - Adherence to project conventions from `CLAUDE.md`
+4. **Post findings as inline PR review comments** using the GitHub API:
+   ```bash
+   gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+     -X POST \
+     -f event="COMMENT" \
+     -f body="Review by forge-loop sub-agent" \
+     --jq .id \
+     -f 'comments[][path]=<file>' \
+     -f 'comments[][position]=<diff position>' \
+     -f 'comments[][body]=<finding>'
+   ```
+   If there are no findings, post a single approving review comment noting the PR
+   looks clean.
+5. Return a summary: count of findings by severity, and whether any are blocking.
+
+The sub-agent must NOT modify any files — it only reads and posts comments.
+
+### 5b — Address review findings
+
+The main thread (orchestrator) processes the sub-agent's findings:
+
+1. Run `/review-pr $PR_NUMBER` to read the posted comments, fix addressable issues,
+   reply in-thread, and create follow-up issues for deferred items.
+2. Push fixes if any were made.
+
+### 5c — Update state
 
 **Update state:**
 ```json
