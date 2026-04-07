@@ -175,18 +175,33 @@ directly on the PR. The sub-agent should:
    - Error handling gaps
    - Test quality and coverage
    - Adherence to project conventions from `CLAUDE.md`
-4. **Post findings as inline PR review comments** using the GitHub API:
+4. **Post findings as inline PR review comments** using the GitHub API. To make the
+   API call actionable, first compute a stable diff anchor for each finding:
+   - Get the PR head SHA: `PR_HEAD_SHA=$(gh pr view $PR_NUMBER --repo $REPO --json headRefOid --jq .headRefOid)`
+   - For each finding, map it to the changed file and the exact changed line in the PR diff.
+     Parse the relevant hunk header from `gh pr diff` (`@@ -old_start,old_count +new_start,new_count @@`)
+     and count subsequent diff lines within that hunk:
+     - lines beginning with `+` (but not `+++`) exist on the `RIGHT` side and increment the new-file line number
+     - lines beginning with `-` (but not `---`) exist on the `LEFT` side and increment the old-file line number
+     - context lines beginning with a space exist on both sides and increment both counters
+   - Prefer the newer review comment fields `line` and `side` instead of legacy `position`.
+     For comments on added/modified code in the PR, use the destination file line number with `side=RIGHT`.
+     Only comment inline on lines that are part of the diff. If a finding cannot be anchored to a changed
+     line, post it as a regular non-inline review body comment instead of inventing a position.
+   - Include the commit being reviewed when creating the review so comments are anchored to the current PR head.
+   Example for a single inline finding on an added line:
    ```bash
+   PR_HEAD_SHA=$(gh pr view $PR_NUMBER --repo $REPO --json headRefOid --jq .headRefOid)
+
    gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" \
      -X POST \
+     -f commit_id="$PR_HEAD_SHA" \
      -f event="COMMENT" \
      -f body="Review by forge-loop sub-agent" \
-     --jq .id \
      -f 'comments[][path]=<file>' \
-     -f 'comments[][position]=<diff position>' \
+     -f 'comments[][line]=<line in new file from diff hunk>' \
+     -f 'comments[][side]=RIGHT' \
      -f 'comments[][body]=<finding>'
-   ```
-   If there are no findings, post a single approving review comment noting the PR
    looks clean.
 5. Return a summary: count of findings by severity, and whether any are blocking.
 
